@@ -1,2 +1,0 @@
-Flask>=3.0,<4
-fyers-apiv3>=3.1.0
