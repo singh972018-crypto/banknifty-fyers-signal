@@ -7,7 +7,10 @@ from fyers_apiv3 import fyersModel
 app = Flask(__name__)
 CLIENT_ID=os.getenv("FYERS_CLIENT_ID","")
 SECRET=os.getenv("FYERS_SECRET","")
-REDIRECT_URI=os.getenv("FYERS_REDIRECT_URI","")
+REDIRECT_URI=os.getenv(
+    "FYERS_REDIRECT_URI",
+    os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/") + "/callback"
+)
 ACCESS_TOKEN=os.getenv("FYERS_ACCESS_TOKEN","")
 MIN_PREMIUM=float(os.getenv("MIN_PREMIUM","30"))
 MAX_PREMIUM=float(os.getenv("MAX_PREMIUM","65"))
@@ -83,21 +86,51 @@ def home():
 
 @app.route("/login")
 def login():
-    s=fyersModel.SessionModel(client_id=CLIENT_ID,secret_key=SECRET,redirect_uri=REDIRECT_URI,response_type="code",grant_type="authorization_code")
+    if not CLIENT_ID or not SECRET:
+        return "FYERS_CLIENT_ID / FYERS_SECRET is missing in Render Environment Variables.", 500
+    if not REDIRECT_URI:
+        return "FYERS_REDIRECT_URI is missing. Set it to your Render URL + /callback.", 500
+
+    s=fyersModel.SessionModel(
+        client_id=CLIENT_ID,
+        secret_key=SECRET,
+        redirect_uri=REDIRECT_URI,
+        response_type="code",
+        grant_type="authorization_code"
+    )
     return redirect(s.generate_authcode())
 
 @app.route("/callback")
 def callback():
+    global ACCESS_TOKEN
     code=request.args.get("auth_code")
-    if not code: return "Missing auth_code",400
-    s=fyersModel.SessionModel(client_id=CLIENT_ID,secret_key=SECRET,redirect_uri=REDIRECT_URI,response_type="code",grant_type="authorization_code")
-    s.set_token(code)
-    r=s.generate_token()
-    return "<h3>FYERS login complete</h3><p>Put the returned access_token into Render as FYERS_ACCESS_TOKEN.</p><pre>"+str(r.get("access_token",""))+"</pre>"
+    if not code:
+        return "Missing auth_code. FYERS did not return an authorization code.", 400
+
+    if not CLIENT_ID or not SECRET or not REDIRECT_URI:
+        return "FYERS OAuth environment variables are not configured correctly in Render.", 500
+
+    try:
+        s=fyersModel.SessionModel(
+            client_id=CLIENT_ID,
+            secret_key=SECRET,
+            redirect_uri=REDIRECT_URI,
+            response_type="code",
+            grant_type="authorization_code"
+        )
+        s.set_token(code)
+        r=s.generate_token()
+        token=r.get("access_token","")
+        if not token:
+            return "<h3>FYERS login failed</h3><pre>"+str(r)+"</pre>", 400
+
+        ACCESS_TOKEN=token
+        return redirect("/")
+    except Exception as e:
+        return "<h3>FYERS login error</h3><pre>"+str(e)+"</pre>", 500
 
 @app.get("/health")
 def health(): return {"ok":True}
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
-        
