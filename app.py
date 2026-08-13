@@ -17,11 +17,29 @@ MAX_PREMIUM=float(os.getenv("MAX_PREMIUM","65"))
 LOT_SIZE=int(os.getenv("BANKNIFTY_LOT_SIZE","30"))
 
 PAGE="""<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{font-family:Arial;background:#111;color:#eee;padding:18px}.card{background:#1d1d1d;padding:20px;border-radius:16px}.sig{font-size:44px;font-weight:bold}.call{color:#35d07f}.put{color:#ff5c6c}.wait{color:#bbb}a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:none}</style>
-<h2>BankNifty 5M Signal</h2><div class="card">
-<div class="sig {{cls}}">{{signal}}</div><p>Score: {{score}}/5</p>
-<p>BankNifty spot: <b>{{spot}}</b></p><p>Suggested: <b>{{option}}</b></p>
-<p>{{note}}</p>{% if contract %}<p><b>Budget option:</b> {{contract}}</p><p><b>Premium:</b> ₹{{premium}} × {{lot}} = <b>₹{{cost}}</b></p>{% endif %}</div><br><a href="/login">Connect FYERS</a>"""
+<style>
+body{font-family:Arial;background:#111;color:#eee;padding:18px}
+.card{background:#1d1d1d;padding:20px;border-radius:16px;margin-bottom:12px}
+.sig{font-size:44px;font-weight:bold}.call{color:#35d07f}.put{color:#ff5c6c}.wait{color:#bbb}
+.row{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #333}
+.small{color:#aaa;font-size:13px}a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:none}
+</style>
+<h2>BankNifty 5M Signal</h2>
+<div class="card">
+<div class="sig {{cls}}">{{signal}}</div>
+<p>Score: {{score}}/5</p>
+<p>BankNifty spot: <b>{{spot}}</b></p>
+<div class="row"><span>Option</span><b>{{contract}}</b></div>
+<div class="row"><span>Entry</span><b>₹{{entry}}</b></div>
+<div class="row"><span>Stop Loss</span><b>₹{{sl}}</b></div>
+<div class="row"><span>Target 1</span><b>₹{{t1}}</b></div>
+<div class="row"><span>Target 2</span><b>₹{{t2}}</b></div>
+<div class="row"><span>Exit</span><b>{{exit_rule}}</b></div>
+<p>{{note}}</p>
+<p class="small">Levels are estimates from the current option premium and 5-minute signal; not guaranteed execution prices.</p>
+</div>
+<br><a href="/login">Connect FYERS</a>"""
+
 
 def calc(c):
     close=[float(x[4]) for x in c]
@@ -60,29 +78,85 @@ def pick_budget_option(spot, signal):
     premium=float(chosen["ltp"]); cost=premium*LOT_SIZE
     return {"symbol":chosen.get("symbol","—"),"premium":round(premium,2),"cost":round(cost,2),"lot":LOT_SIZE,"within":bool(in_range)}
 
+def make_levels(entry, signal):
+    """Conservative option-premium risk levels.
+
+    Uses a 15% stop and 25% / 40% profit targets. The levels are guidance
+    only; the user should exit if the signal reverses before targets.
+    """
+    entry = float(entry)
+    sl = round(entry * 0.85, 2)
+    t1 = round(entry * 1.25, 2)
+    t2 = round(entry * 1.40, 2)
+    return sl, t1, t2
+
+
 @app.route("/")
 def home():
     if not ACCESS_TOKEN:
-        return render_template_string(PAGE,signal="WAIT",cls="wait",score=0,spot="—",option="Connect FYERS",contract=None,premium="—",cost="—",lot=LOT_SIZE,note="FYERS is not connected.")
+        return render_template_string(
+            PAGE, signal="WAIT", cls="wait", score=0, spot="—",
+            contract="—", entry="—", sl="—", t1="—", t2="—",
+            exit_rule="Connect FYERS", note="FYERS is not connected."
+        )
+
     try:
-        fy=fyersModel.FyersModel(client_id=CLIENT_ID,token=ACCESS_TOKEN,is_async=False,log_path="")
-        now=datetime.now(timezone.utc); start=now-timedelta(days=5)
-        r=fy.history({"symbol":"NSE:NIFTYBANK-INDEX","resolution":"5","date_format":"1","range_from":start.strftime("%Y-%m-%d"),"range_to":now.strftime("%Y-%m-%d"),"cont_flag":"1"})
-        candles=r.get("candles",[])
-        if len(candles)<50: raise ValueError("Not enough 5-minute candles returned by FYERS.")
-        sig,score,spot=calc(candles); contract=None; premium="—"; cost="—"; lot=LOT_SIZE
-        note="Technical signal only; not a guaranteed trade."
+        fy=fyersModel.FyersModel(
+            client_id=CLIENT_ID, token=ACCESS_TOKEN,
+            is_async=False, log_path=""
+        )
+        now=datetime.now(timezone.utc)
+        start=now-timedelta(days=5)
+
+        r=fy.history({
+            "symbol":"NSE:NIFTYBANK-INDEX",
+            "resolution":"5",
+            "date_format":"1",
+            "range_from":start.strftime("%Y-%m-%d"),
+            "range_to":now.strftime("%Y-%m-%d"),
+            "cont_flag":"1"
+        })
+
+        candles=r.get("candles", [])
+        if len(candles) < 50:
+            raise ValueError("Not enough 5-minute candles returned by FYERS.")
+
+        sig,score,spot=calc(candles)
+
+        contract = "—"
+        entry = sl = t1 = t2 = "—"
+        exit_rule = "WAIT / no trade"
+        note = "Technical signal only; not a guaranteed trade."
+
         if sig in ("CALL","PUT"):
             try:
-                x=pick_budget_option(spot,sig)
-                if x:
-                    contract=x["symbol"]; premium=x["premium"]; cost=x["cost"]
-                    note += " Budget filter: ₹30–₹65 premium." if x["within"] else " No contract was inside ₹30–₹65; nearest available premium is shown."
-                else: note += " No suitable option contract returned."
-            except Exception as oe: note += " Option-chain lookup failed: "+str(oe)
-        return render_template_string(PAGE,signal=sig,cls=sig.lower(),score=abs(score),spot=round(spot,2),option=("CALL/PUT selected by signal" if sig in ("CALL","PUT") else "Wait"),contract=contract,premium=premium,cost=cost,lot=lot,note=note)
+                selected = pick_budget_option(spot, sig)
+                if selected:
+                    contract = selected["symbol"]
+                    entry = round(float(selected["premium"]), 2)
+                    sl, t1, t2 = make_levels(entry, sig)
+                    exit_rule = f"Exit at T1/T2 or immediately if signal reverses to {('PUT' if sig=='CALL' else 'CALL')}."
+                    if selected.get("within_budget"):
+                        note += f" Budget premium target: ₹{MIN_PREMIUM:.0f}–₹{MAX_PREMIUM:.0f}."
+                    else:
+                        note += " No contract was inside the preferred premium range."
+                else:
+                    note += " No suitable option contract was returned."
+            except Exception as oe:
+                note += " Option-chain lookup failed: " + str(oe)
+
+        return render_template_string(
+            PAGE, signal=sig, cls=sig.lower(), score=abs(score),
+            spot=round(spot,2), contract=contract, entry=entry,
+            sl=sl, t1=t1, t2=t2, exit_rule=exit_rule, note=note
+        )
+
     except Exception as e:
-        return render_template_string(PAGE,signal="WAIT",cls="wait",score=0,spot="—",option="—",contract=None,premium="—",cost="—",lot=LOT_SIZE,note="Data error: "+str(e))
+        return render_template_string(
+            PAGE, signal="WAIT", cls="wait", score=0, spot="—",
+            contract="—", entry="—", sl="—", t1="—", t2="—",
+            exit_rule="No trade", note="Data error: "+str(e)
+        )
 
 @app.route("/login")
 def login():
@@ -134,3 +208,4 @@ def health(): return {"ok":True}
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
+             
