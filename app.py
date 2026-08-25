@@ -2,6 +2,9 @@ import os
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, redirect, render_template_string
 import requests
+import json
+import gspread
+from google.oauth2.service_account import Credentials
 from fyers_apiv3 import fyersModel
 
 app = Flask(__name__)
@@ -15,8 +18,12 @@ ACCESS_TOKEN=os.getenv("FYERS_ACCESS_TOKEN","")
 MIN_PREMIUM=float(os.getenv("MIN_PREMIUM","30"))
 MAX_PREMIUM=float(os.getenv("MAX_PREMIUM","65"))
 LOT_SIZE=int(os.getenv("BANKNIFTY_LOT_SIZE","30"))
+GOOGLE_SHEET_ID=os.getenv("GOOGLE_SHEET_ID","")
+GOOGLE_SERVICE_ACCOUNT_JSON=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON","")
+
 
 PAGE="""<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="300">
 <style>
 body{font-family:Arial;background:#111;color:#eee;padding:18px}
 .card{background:#1d1d1d;padding:20px;border-radius:16px;margin-bottom:12px}
@@ -25,6 +32,8 @@ body{font-family:Arial;background:#111;color:#eee;padding:18px}
 .small{color:#aaa;font-size:13px}a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:none}
 </style>
 <h2>BankNifty 5M Signal</h2>
+<div class="card"><b>🔄 Auto-refresh: ON</b><br>
+<span class="small">Page refreshes every 5 minutes to fetch the latest signal.</span></div>
 <div class="card">
 <div class="sig {{cls}}">{{signal}}</div>
 <p>Score: {{score}}/5</p>
@@ -77,6 +86,61 @@ def pick_budget_option(spot, signal):
         chosen=min(legs,key=lambda x:(abs(float(x["ltp"])-mid),abs(float(x["strike_price"])-spot)))
     premium=float(chosen["ltp"]); cost=premium*LOT_SIZE
     return {"symbol":chosen.get("symbol","—"),"premium":round(premium,2),"cost":round(cost,2),"lot":LOT_SIZE,"within":bool(in_range)}
+
+
+JOURNAL_HEADERS = [
+    "timestamp_utc","signal","score","banknifty_spot","option_symbol",
+    "entry","stop_loss","target_1","target_2","exit_rule",
+    "status","exit_price","pnl_per_lot","notes"
+]
+
+def get_journal_sheet():
+    if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+    ws = sh.sheet1
+    if not ws.get_all_values():
+        ws.append_row(JOURNAL_HEADERS, value_input_option="USER_ENTERED")
+    return ws
+
+def journal_signal(signal, score, spot, contract, entry, sl, t1, t2, exit_rule, note):
+    if not contract or contract == "—" or entry in ("—", None):
+        return
+    try:
+        ws = get_journal_sheet()
+        if ws is None:
+            return
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        values = ws.get_all_values()
+        # Refreshing the page must not create duplicate rows for the same
+        # signal/contract in the same 5-minute candle.
+        if len(values) > 1:
+            last = values[-1]
+            if len(last) >= 5:
+                try:
+                    last_dt = datetime.strptime(last[0], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    cur_dt = datetime.strptime(now, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    same_bucket = (int(last_dt.timestamp()) // 300) == (int(cur_dt.timestamp()) // 300)
+                except Exception:
+                    same_bucket = False
+                if same_bucket and last[1] == signal and last[4] == contract:
+                    return
+
+        ws.append_row([
+            now, signal, score, round(float(spot), 2), contract,
+            float(entry), float(sl), float(t1), float(t2), exit_rule,
+            "OPEN", "", "", note
+        ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        # Journal failure never breaks the signal page.
+        print("Google Sheet journal error:", e)
 
 def make_levels(entry, signal):
     """Conservative option-premium risk levels.
@@ -145,6 +209,11 @@ def home():
             except Exception as oe:
                 note += " Option-chain lookup failed: " + str(oe)
 
+        journal_signal(
+            sig, abs(score), spot, contract, entry, sl, t1, t2,
+            exit_rule, note
+        )
+
         return render_template_string(
             PAGE, signal=sig, cls=sig.lower(), score=abs(score),
             spot=round(spot,2), contract=contract, entry=entry,
@@ -208,4 +277,4 @@ def health(): return {"ok":True}
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
-             
+    
