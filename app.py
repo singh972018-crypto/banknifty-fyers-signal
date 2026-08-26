@@ -19,6 +19,13 @@ LOT_SIZE=int(os.getenv("BANKNIFTY_LOT_SIZE","30"))
 GOOGLE_SHEET_ID=os.getenv("GOOGLE_SHEET_ID","")
 GOOGLE_SERVICE_ACCOUNT_JSON=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON","")
 
+# Render Secret File support
+if not GOOGLE_SERVICE_ACCOUNT_JSON:
+    secret_file = "/etc/secrets/google_service_account.json"
+    if os.path.exists(secret_file):
+        with open(secret_file, "r", encoding="utf-8") as f:
+            GOOGLE_SERVICE_ACCOUNT_JSON = f.read()
+
 PAGE="""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="300">
@@ -267,3 +274,4 @@ def health(): return {"ok":True}
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
+    
