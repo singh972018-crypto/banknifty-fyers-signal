@@ -3,8 +3,6 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, request, redirect, render_template_string
 import requests
 import json
-import gspread
-from google.oauth2.service_account import Credentials
 from fyers_apiv3 import fyersModel
 
 app = Flask(__name__)
@@ -16,15 +14,6 @@ ACCESS_TOKEN=os.getenv("FYERS_ACCESS_TOKEN","")
 MIN_PREMIUM=float(os.getenv("MIN_PREMIUM","30"))
 MAX_PREMIUM=float(os.getenv("MAX_PREMIUM","65"))
 LOT_SIZE=int(os.getenv("BANKNIFTY_LOT_SIZE","30"))
-GOOGLE_SHEET_ID=os.getenv("GOOGLE_SHEET_ID","")
-GOOGLE_SERVICE_ACCOUNT_JSON=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON","")
-
-# Render Secret File support
-if not GOOGLE_SERVICE_ACCOUNT_JSON:
-    secret_file = "/etc/secrets/google_service_account.json"
-    if os.path.exists(secret_file):
-        with open(secret_file, "r", encoding="utf-8") as f:
-            GOOGLE_SERVICE_ACCOUNT_JSON = f.read()
 
 PAGE="""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -42,7 +31,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="card"><b>🔄 Auto-refresh: ON</b><br><span class="small">Page refreshes every 5 minutes to fetch the latest signal.</span></div>
 <div class="card">
 <div class="sig {{cls}}">{{signal}}</div>
-<p><b>Score: {{score}}/5</b></p>
+<p><b>Score: {{score}}/4</b> &nbsp; <b>{{strength}}</b></p>
 <p>BankNifty spot: <b>{{spot}}</b></p>
 <div class="row"><span>Option</span><b>{{contract}}</b></div>
 <div class="row"><span>Entry</span><b>₹{{entry}}</b></div>
@@ -51,13 +40,12 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="row"><span>Target 2</span><b>₹{{t2}}</b></div>
 <div class="row"><span>Exit</span><b>{{exit_rule}}</b></div>
 <p>{{note}}</p></div>
-<div class="card"><h3>📊 5 Signal Conditions</h3>
+<div class="card"><h3>📊 4 Signal Conditions</h3>
 <div class="debug">
-<div class="row"><span>1. Price vs EMA 9</span><b class="{{c1_cls}}">{{c1}}</b></div>
-<div class="row"><span>2. EMA 9 vs EMA 21</span><b class="{{c2_cls}}">{{c2}}</b></div>
-<div class="row"><span>3. Price vs VWAP</span><b class="{{c3_cls}}">{{c3}}</b></div>
-<div class="row"><span>4. RSI</span><b class="{{c4_cls}}">{{c4}}</b></div>
-<div class="row"><span>5. Volume</span><b class="{{c5_cls}}">{{c5}}</b></div>
+<div class="row"><span>1. EMA 9 / EMA 21 Trend</span><b class="{{c1_cls}}">{{c1}}</b></div>
+<div class="row"><span>2. Price vs VWAP</span><b class="{{c2_cls}}">{{c2}}</b></div>
+<div class="row"><span>3. RSI Momentum</span><b class="{{c3_cls}}">{{c3}}</b></div>
+<div class="row"><span>4. Volume Confirmation</span><b class="{{c4_cls}}">{{c4}}</b></div>
 </div></div>
 <div class="card"><h3>📈 Indicator Data</h3>
 <div class="row"><span>Price</span><b>{{price}}</b></div>
@@ -86,7 +74,8 @@ def calc(candles):
     high=[float(x[2]) for x in candles]
     low=[float(x[3]) for x in candles]
     volume=[float(x[5]) for x in candles]
-    if len(close)<50: raise ValueError("Not enough candles for signal calculation.")
+    if len(close)<50:
+        raise ValueError("Not enough candles for signal calculation.")
 
     e9=ema(close[-50:],9)
     e21=ema(close[-50:],21)
@@ -104,30 +93,40 @@ def calc(candles):
     avg_volume=sum(volume[-21:-1])/len(volume[-21:-1]) if len(volume)>=21 else sum(volume)/len(volume)
     price=close[-1]
 
-    call_conditions=[price>e9,e9>e21,price>vwap,rsi>=55,current_volume>avg_volume]
-    put_conditions=[price<e9,e9<e21,price<vwap,rsi<=45,current_volume>avg_volume]
+    call_conditions=[e9>e21, price>vwap, rsi>=52, current_volume>avg_volume]
+    put_conditions=[e9<e21, price<vwap, rsi<=48, current_volume>avg_volume]
     call_score=sum(call_conditions)
     put_score=sum(put_conditions)
 
-    if call_score>=4: signal="CALL"; score=call_score
-    elif put_score>=4: signal="PUT"; score=-put_score
+    if call_score>=3 and call_score>put_score:
+        signal="CALL"; score=call_score
+    elif put_score>=3 and put_score>call_score:
+        signal="PUT"; score=-put_score
     else:
-        signal="WAIT"
-        score=call_score if call_score>=put_score else -put_score
+        signal="WAIT"; score=call_score if call_score>=put_score else -put_score
 
     if signal=="CALL":
         conditions=["PASS" if x else "FAIL" for x in call_conditions]
+        strength="STRONG" if call_score==4 else "NORMAL"
     elif signal=="PUT":
         conditions=["PASS" if x else "FAIL" for x in put_conditions]
+        strength="STRONG" if put_score==4 else "NORMAL"
     else:
         conditions=[]
-        for i in range(5):
-            if call_conditions[i]: conditions.append("CALL PASS")
-            elif put_conditions[i]: conditions.append("PUT PASS")
-            else: conditions.append("FAIL")
+        for i in range(4):
+            if call_conditions[i] and not put_conditions[i]:
+                conditions.append("CALL PASS")
+            elif put_conditions[i] and not call_conditions[i]:
+                conditions.append("PUT PASS")
+            elif call_conditions[i] and put_conditions[i]:
+                conditions.append("PASS")
+            else:
+                conditions.append("FAIL")
+        strength="WATCH"
 
-    return {"signal":signal,"score":score,"spot":price,"ema9":e9,"ema21":e21,
-            "vwap":vwap,"rsi":rsi,"volume":current_volume,"avg_volume":avg_volume,
+    return {"signal":signal,"score":score,"strength":strength,"spot":price,
+            "ema9":e9,"ema21":e21,"vwap":vwap,"rsi":rsi,
+            "volume":current_volume,"avg_volume":avg_volume,
             "conditions":conditions}
 
 def pick_budget_option(spot, signal):
@@ -152,42 +151,6 @@ def pick_budget_option(spot, signal):
     return {"symbol":chosen.get("symbol","—"),"premium":round(premium,2),
             "cost":round(premium*LOT_SIZE,2),"lot":LOT_SIZE,"within":within}
 
-JOURNAL_HEADERS=["timestamp_utc","signal","score","banknifty_spot","option_symbol","entry","stop_loss","target_1","target_2","exit_rule","status","exit_price","pnl_per_lot","notes"]
-
-def get_journal_sheet():
-    if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
-        print("Google Sheet ENV variables are missing.")
-        return None
-    info=json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds=Credentials.from_service_account_info(info,scopes=scopes)
-    gc=gspread.authorize(creds)
-    sh=gc.open_by_key(GOOGLE_SHEET_ID)
-    ws=sh.sheet1
-    if not ws.get_all_values(): ws.append_row(JOURNAL_HEADERS,value_input_option="USER_ENTERED")
-    return ws
-
-def journal_signal(signal,score,spot,contract,entry,sl,t1,t2,exit_rule,note):
-    if not contract or contract=="—" or entry in ("—",None): return
-    try:
-        ws=get_journal_sheet()
-        if ws is None: return
-        now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        values=ws.get_all_values()
-        if len(values)>1:
-            last=values[-1]
-            if len(last)>=5:
-                try:
-                    last_dt=datetime.strptime(last[0],"%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    cur_dt=datetime.strptime(now,"%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    same_bucket=(int(last_dt.timestamp())//300)==(int(cur_dt.timestamp())//300)
-                except Exception: same_bucket=False
-                if same_bucket and last[1]==signal and last[4]==contract: return
-        ws.append_row([now,signal,score,round(float(spot),2),contract,float(entry),float(sl),float(t1),float(t2),exit_rule,"OPEN","","",note],value_input_option="USER_ENTERED")
-        print("Google Sheet journal row added.")
-    except Exception as e:
-        print("Google Sheet journal error:",e)
-
 def make_levels(entry,signal):
     entry=float(entry)
     return round(entry*0.85,2),round(entry*1.25,2),round(entry*1.40,2)
@@ -200,7 +163,7 @@ def condition_class(value):
 @app.route("/")
 def home():
     if not ACCESS_TOKEN:
-        return render_template_string(PAGE,signal="WAIT",cls="wait",score=0,spot="—",contract="—",entry="—",sl="—",t1="—",t2="—",exit_rule="Connect FYERS",note="FYERS is not connected.",c1="—",c2="—",c3="—",c4="—",c5="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",c5_cls="neutral",price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—")
+        return render_template_string(PAGE,signal="WAIT",cls="wait",score=0,spot="—",contract="—",entry="—",sl="—",t1="—",t2="—",exit_rule="Connect FYERS",note="FYERS is not connected.",strength="—",c1="—",c2="—",c3="—",c4="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—")
 
     try:
         fy=fyersModel.FyersModel(client_id=CLIENT_ID,token=ACCESS_TOKEN,is_async=False,log_path="")
@@ -229,21 +192,19 @@ def home():
                 else: note+=" No suitable option contract was returned."
             except Exception as oe: note+=" Option-chain lookup failed: "+str(oe)
 
-        journal_signal(sig,abs(score),spot,contract,entry,sl,t1,t2,exit_rule,note)
-
         conditions=result["conditions"]
-        c1,c2,c3,c4,c5=conditions
+        c1,c2,c3,c4=conditions
 
         return render_template_string(PAGE,signal=sig,cls=sig.lower(),score=abs(score),spot=round(spot,2),
             contract=contract,entry=entry,sl=sl,t1=t1,t2=t2,exit_rule=exit_rule,note=note,
-            c1=c1,c2=c2,c3=c3,c4=c4,c5=c5,c1_cls=condition_class(c1),c2_cls=condition_class(c2),
-            c3_cls=condition_class(c3),c4_cls=condition_class(c4),c5_cls=condition_class(c5),
+            c1=c1,c2=c2,c3=c3,c4=c4,c1_cls=condition_class(c1),c2_cls=condition_class(c2),
+            c3_cls=condition_class(c3),c4_cls=condition_class(c4),
             price=round(result["spot"],2),ema9=round(result["ema9"],2),ema21=round(result["ema21"],2),
             vwap=round(result["vwap"],2),rsi=round(result["rsi"],2),volume=round(result["volume"],0),
             avg_volume=round(result["avg_volume"],0))
     except Exception as e:
         return render_template_string(PAGE,signal="WAIT",cls="wait",score=0,spot="—",contract="—",entry="—",sl="—",t1="—",t2="—",exit_rule="No trade",note="Data error: "+str(e),
-            c1="—",c2="—",c3="—",c4="—",c5="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",c5_cls="neutral",
+            strength="—",c1="—",c2="—",c3="—",c4="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",
             price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—")
 
 @app.route("/login")
