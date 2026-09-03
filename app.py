@@ -2,7 +2,6 @@ import os
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, redirect, render_template_string
 import requests
-import json
 from fyers_apiv3 import fyersModel
 
 app = Flask(__name__)
@@ -31,7 +30,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="card"><b>🔄 Auto-refresh: ON</b><br><span class="small">Page refreshes every 5 minutes to fetch the latest signal.</span></div>
 <div class="card">
 <div class="sig {{cls}}">{{signal}}</div>
-<p><b>Score: {{score}}/4</b> &nbsp; <b>{{strength}}</b></p>
+<p><b>Score: {{score}}/4 &nbsp; <b>{{strength}}</b></b></p>
 <p>BankNifty spot: <b>{{spot}}</b></p>
 <div class="row"><span>Option</span><b>{{contract}}</b></div>
 <div class="row"><span>Entry</span><b>₹{{entry}}</b></div>
@@ -40,13 +39,18 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="row"><span>Target 2</span><b>₹{{t2}}</b></div>
 <div class="row"><span>Exit</span><b>{{exit_rule}}</b></div>
 <p>{{note}}</p></div>
-<div class="card"><h3>📊 4 Signal Conditions</h3>
+<div class="card"><h3>📊 4 Core Signal Conditions</h3>
 <div class="debug">
 <div class="row"><span>1. EMA 9 / EMA 21 Trend</span><b class="{{c1_cls}}">{{c1}}</b></div>
 <div class="row"><span>2. Price vs VWAP</span><b class="{{c2_cls}}">{{c2}}</b></div>
 <div class="row"><span>3. RSI Momentum</span><b class="{{c3_cls}}">{{c3}}</b></div>
 <div class="row"><span>4. Volume Confirmation</span><b class="{{c4_cls}}">{{c4}}</b></div>
 </div></div>
+<div class="card"><h3>🧭 Strength Confirmations</h3>
+<div class="row"><span>ADX + DI Trend Strength</span><b class="{{x1_cls}}">{{x1}}</b></div>
+<div class="row"><span>Candle Confirmation</span><b class="{{x2_cls}}">{{x2}}</b></div>
+<div class="row"><span>ATR Volatility</span><b class="{{x3_cls}}">{{x3}}</b></div>
+</div>
 <div class="card"><h3>📈 Indicator Data</h3>
 <div class="row"><span>Price</span><b>{{price}}</b></div>
 <div class="row"><span>EMA 9</span><b>{{ema9}}</b></div>
@@ -55,6 +59,9 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="row"><span>RSI</span><b>{{rsi}}</b></div>
 <div class="row"><span>Current Volume</span><b>{{volume}}</b></div>
 <div class="row"><span>Average Volume</span><b>{{avg_volume}}</b></div>
+<div class="row"><span>ADX</span><b>{{adx}}</b></div>
+<div class="row"><span>ATR</span><b>{{atr}}</b></div>
+<div class="row"><span>Candle Range</span><b>{{candle_range}}</b></div>
 </div>
 <div class="card"><p>Technical signal only; not a guaranteed trade.</p>
 <p class="small">Levels are estimates from the current option premium and 5-minute signal; not guaranteed execution prices.</p></div>
@@ -74,60 +81,104 @@ def calc(candles):
     high=[float(x[2]) for x in candles]
     low=[float(x[3]) for x in candles]
     volume=[float(x[5]) for x in candles]
-    if len(close)<50:
-        raise ValueError("Not enough candles for signal calculation.")
+    if len(close)<60:
+        raise ValueError("Not enough 5-minute candles for signal calculation.")
 
-    e9=ema(close[-50:],9)
-    e21=ema(close[-50:],21)
+    price=close[-1]
+    e9=ema(close[-60:],9)
+    e21=ema(close[-60:],21)
+
+    # Session-style VWAP from the returned candles.
     typical=[(h+l+c)/3 for h,l,c in zip(high,low,close)]
     total_volume=sum(volume)
-    vwap=sum(tp*v for tp,v in zip(typical,volume))/total_volume if total_volume>0 else close[-1]
+    vwap=sum(tp*v for tp,v in zip(typical,volume))/total_volume if total_volume else price
 
+    # RSI(14), using the same simple-average method as the original project.
     changes=[close[i]-close[i-1] for i in range(1,len(close))]
     recent=changes[-14:]
     gains=sum(max(x,0) for x in recent)/14
     losses=sum(max(-x,0) for x in recent)/14
     rsi=100.0 if losses==0 else 100-(100/(1+gains/losses))
 
+    # Volume confirmation against the previous 20 completed candles.
     current_volume=volume[-1]
-    avg_volume=sum(volume[-21:-1])/len(volume[-21:-1]) if len(volume)>=21 else sum(volume)/len(volume)
-    price=close[-1]
+    avg_volume=sum(volume[-21:-1])/20 if len(volume)>=21 else sum(volume)/len(volume)
 
-    call_conditions=[e9>e21, price>vwap, rsi>=52, current_volume>avg_volume]
-    put_conditions=[e9<e21, price<vwap, rsi<=48, current_volume>avg_volume]
-    call_score=sum(call_conditions)
-    put_score=sum(put_conditions)
+    # ADX(14) -- trend-strength filter.
+    tr=[]; plus_dm=[]; minus_dm=[]
+    for i in range(1,len(close)):
+        up=high[i]-high[i-1]
+        down=low[i-1]-low[i]
+        tr.append(max(high[i]-low[i],abs(high[i]-close[i-1]),abs(low[i]-close[i-1])))
+        plus_dm.append(up if up>down and up>0 else 0.0)
+        minus_dm.append(down if down>up and down>0 else 0.0)
+    n=14
+    if len(tr)>=n:
+        atr14=sum(tr[-n:])/n
+        pdi=100*(sum(plus_dm[-n:])/n)/(atr14 or 1)
+        mdi=100*(sum(minus_dm[-n:])/n)/(atr14 or 1)
+        dx=100*abs(pdi-mdi)/(pdi+mdi) if (pdi+mdi) else 0.0
+        # A compact rolling ADX estimate from the latest 14 DX values.
+        dxs=[]
+        for j in range(max(n-1,len(tr)-n),len(tr)):
+            a=max(0,j-n+1); b=j+1
+            atr=sum(tr[a:b])/len(tr[a:b]) or 1
+            p=100*(sum(plus_dm[a:b])/len(plus_dm[a:b]))/atr
+            m=100*(sum(minus_dm[a:b])/len(minus_dm[a:b]))/atr
+            dxs.append(100*abs(p-m)/(p+m) if p+m else 0.0)
+        adx=sum(dxs)/len(dxs) if dxs else dx
+    else:
+        atr14=0.0; pdi=mdi=adx=0.0
 
+    # ATR as a volatility filter. Compare current candle range with ATR.
+    candle_range=high[-1]-low[-1]
+    atr_ok=candle_range >= atr14*0.60 if atr14>0 else True
+
+    # Candle confirmation: body direction + close location.
+    body=abs(close[-1]-close[-2])
+    bull_candle=close[-1]>close[-2] and body >= candle_range*0.35 if candle_range>0 else False
+    bear_candle=close[-1]<close[-2] and body >= candle_range*0.35 if candle_range>0 else False
+
+    # Core indicators + strength confirmations.
+    core_call=[e9>e21,price>vwap,rsi>=52,current_volume>avg_volume]
+    core_put=[e9<e21,price<vwap,rsi<=48,current_volume>avg_volume]
+    call_score=sum(core_call); put_score=sum(core_put)
+
+    # ADX confirms trend direction; candle confirms immediate price action;
+    # ATR confirms enough movement. These are confirmations, not extra core votes.
+    call_confirmations=[adx>=20 and pdi>mdi,bull_candle,atr_ok]
+    put_confirmations=[adx>=20 and mdi>pdi,bear_candle,atr_ok]
+    call_conf=sum(call_confirmations); put_conf=sum(put_confirmations)
+
+    # Require 3/4 core conditions. Then use confirmations to classify strength.
     if call_score>=3 and call_score>put_score:
-        signal="CALL"; score=call_score
+        signal="CALL"
+        strength="STRONG" if call_score==4 and call_conf>=2 else ("NORMAL" if call_conf>=1 else "CAUTION")
+        score=call_score
+        conditions=["PASS" if x else "FAIL" for x in core_call]
+        confirmations=["PASS" if x else "FAIL" for x in call_confirmations]
     elif put_score>=3 and put_score>call_score:
-        signal="PUT"; score=-put_score
+        signal="PUT"
+        strength="STRONG" if put_score==4 and put_conf>=2 else ("NORMAL" if put_conf>=1 else "CAUTION")
+        score=-put_score
+        conditions=["PASS" if x else "FAIL" for x in core_put]
+        confirmations=["PASS" if x else "FAIL" for x in put_confirmations]
     else:
-        signal="WAIT"; score=call_score if call_score>=put_score else -put_score
-
-    if signal=="CALL":
-        conditions=["PASS" if x else "FAIL" for x in call_conditions]
-        strength="STRONG" if call_score==4 else "NORMAL"
-    elif signal=="PUT":
-        conditions=["PASS" if x else "FAIL" for x in put_conditions]
-        strength="STRONG" if put_score==4 else "NORMAL"
-    else:
+        signal="WAIT"
+        score=call_score if call_score>=put_score else -put_score
         conditions=[]
         for i in range(4):
-            if call_conditions[i] and not put_conditions[i]:
-                conditions.append("CALL PASS")
-            elif put_conditions[i] and not call_conditions[i]:
-                conditions.append("PUT PASS")
-            elif call_conditions[i] and put_conditions[i]:
-                conditions.append("PASS")
-            else:
-                conditions.append("FAIL")
+            if core_call[i] and not core_put[i]: conditions.append("CALL PASS")
+            elif core_put[i] and not core_call[i]: conditions.append("PUT PASS")
+            else: conditions.append("FAIL")
+        confirmations=["—","—","—"]
         strength="WATCH"
 
     return {"signal":signal,"score":score,"strength":strength,"spot":price,
             "ema9":e9,"ema21":e21,"vwap":vwap,"rsi":rsi,
             "volume":current_volume,"avg_volume":avg_volume,
-            "conditions":conditions}
+            "adx":adx,"atr":atr14,"candle_range":candle_range,
+            "conditions":conditions,"confirmations":confirmations}
 
 def pick_budget_option(spot, signal):
     headers={"Authorization":f"{CLIENT_ID}:{ACCESS_TOKEN}"}
@@ -163,7 +214,7 @@ def condition_class(value):
 @app.route("/")
 def home():
     if not ACCESS_TOKEN:
-        return render_template_string(PAGE,signal="WAIT",cls="wait",score=0,spot="—",contract="—",entry="—",sl="—",t1="—",t2="—",exit_rule="Connect FYERS",note="FYERS is not connected.",strength="—",c1="—",c2="—",c3="—",c4="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—")
+        return render_template_string(PAGE,signal="WAIT",cls="wait",score=0,spot="—",contract="—",entry="—",sl="—",t1="—",t2="—",exit_rule="Connect FYERS",note="FYERS is not connected.",strength="—",c1="—",c2="—",c3="—",c4="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",x1="—",x2="—",x3="—",x1_cls="neutral",x2_cls="neutral",x3_cls="neutral",price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—")
 
     try:
         fy=fyersModel.FyersModel(client_id=CLIENT_ID,token=ACCESS_TOKEN,is_async=False,log_path="")
@@ -195,16 +246,17 @@ def home():
         conditions=result["conditions"]
         c1,c2,c3,c4=conditions
 
-        return render_template_string(PAGE,signal=sig,cls=sig.lower(),score=abs(score),spot=round(spot,2),
+        return render_template_string(PAGE,signal=sig,cls=sig.lower(),score=abs(score),strength=result["strength"],spot=round(spot,2),
             contract=contract,entry=entry,sl=sl,t1=t1,t2=t2,exit_rule=exit_rule,note=note,
             c1=c1,c2=c2,c3=c3,c4=c4,c1_cls=condition_class(c1),c2_cls=condition_class(c2),
-            c3_cls=condition_class(c3),c4_cls=condition_class(c4),
+            c3_cls=condition_class(c3),c4_cls=condition_class(c4),x1=result["confirmations"][0],x2=result["confirmations"][1],x3=result["confirmations"][2],
+            x1_cls=condition_class(result["confirmations"][0]),x2_cls=condition_class(result["confirmations"][1]),x3_cls=condition_class(result["confirmations"][2]),
             price=round(result["spot"],2),ema9=round(result["ema9"],2),ema21=round(result["ema21"],2),
             vwap=round(result["vwap"],2),rsi=round(result["rsi"],2),volume=round(result["volume"],0),
-            avg_volume=round(result["avg_volume"],0))
+            avg_volume=round(result["avg_volume"],0),adx=round(result["adx"],1),atr=round(result["atr"],2),candle_range=round(result["candle_range"],2))
     except Exception as e:
         return render_template_string(PAGE,signal="WAIT",cls="wait",score=0,spot="—",contract="—",entry="—",sl="—",t1="—",t2="—",exit_rule="No trade",note="Data error: "+str(e),
-            strength="—",c1="—",c2="—",c3="—",c4="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",
+            strength="—",c1="—",c2="—",c3="—",c4="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",x1="—",x2="—",x3="—",x1_cls="neutral",x2_cls="neutral",x3_cls="neutral",
             price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—")
 
 @app.route("/login")
@@ -235,4 +287,4 @@ def health(): return {"ok":True}
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
-    
+        
