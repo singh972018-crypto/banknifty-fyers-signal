@@ -28,17 +28,33 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 </style>
 <h2>BankNifty 5M Signal</h2>
 <div class="card"><b>🔄 Auto-refresh: ON</b><br><span class="small">Page refreshes every 5 minutes to fetch the latest signal.</span></div>
-<div class="card">
-<div class="sig {{cls}}">{{signal}}</div>
-<p><b>Score: {{score}}/4 &nbsp; <b>{{strength}}</b></b></p>
-<p>BankNifty spot: <b>{{spot}}</b></p>
-<div class="row"><span>Option</span><b>{{contract}}</b></div>
-<div class="row"><span>Entry</span><b>₹{{entry}}</b></div>
-<div class="row"><span>Stop Loss</span><b>₹{{sl}}</b></div>
-<div class="row"><span>Target 1</span><b>₹{{t1}}</b></div>
-<div class="row"><span>Target 2</span><b>₹{{t2}}</b></div>
-<div class="row"><span>Exit</span><b>{{exit_rule}}</b></div>
-<p>{{note}}</p></div>
+<div class="card"><h3>🟢 LIVE ANALYSIS A — Budget band ₹2,000</h3>
+<div class="sig {{sig_a_cls}}">{{sig_a}}</div>
+<p><b>{{strength_a}}</b> &nbsp; Score: <b>{{score_a}}/4</b></p>
+<div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
+<div class="row"><span>Reference option</span><b>{{contract_a}}</b></div>
+<div class="row"><span>Live premium</span><b>₹{{premium_a}}</b></div>
+<div class="row"><span>Approx. 1-lot value</span><b>₹{{cost_a}}</b></div>
+<p class="small">Live-market reference only. No order placement is performed by this app.</p></div>
+
+<div class="card"><h3>🔵 LIVE ANALYSIS B — Budget band ₹5,000</h3>
+<div class="sig {{sig_b_cls}}">{{sig_b}}</div>
+<p><b>{{strength_b}}</b> &nbsp; Score: <b>{{score_b}}/4</b></p>
+<div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
+<div class="row"><span>Reference option</span><b>{{contract_b}}</b></div>
+<div class="row"><span>Live premium</span><b>₹{{premium_b}}</b></div>
+<div class="row"><span>Approx. 1-lot value</span><b>₹{{cost_b}}</b></div>
+<p class="small">Live-market reference only. No order placement is performed by this app.</p></div>
+
+<div class="card"><h3>🟣 LIVE ANALYSIS C — Highest-confidence setup</h3>
+<div class="sig {{sig_c_cls}}">{{sig_c}}</div>
+<p><b>{{strength_c}}</b> &nbsp; Score: <b>{{score_c}}/4</b></p>
+<div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
+<div class="row"><span>Reference option</span><b>{{contract_c}}</b></div>
+<div class="row"><span>Live premium</span><b>₹{{premium_c}}</b></div>
+<div class="row"><span>Approx. 1-lot value</span><b>₹{{cost_c}}</b></div>
+<div class="row"><span>Confirmation score</span><b>{{conf_c}}/3</b></div>
+<p class="small">Chosen from the live indicator/confirmation score; this is not a prediction of future price.</p></div>
 <div class="card"><h3>📊 4 Core Signal Conditions</h3>
 <div class="debug">
 <div class="row"><span>1. EMA 9 / EMA 21 Trend</span><b class="{{c1_cls}}">{{c1}}</b></div>
@@ -202,6 +218,20 @@ def pick_budget_option(spot, signal):
     return {"symbol":chosen.get("symbol","—"),"premium":round(premium,2),
             "cost":round(premium*LOT_SIZE,2),"lot":LOT_SIZE,"within":within}
 
+def pick_budget_option(spot, signal, max_budget):
+    headers={"Authorization":f"{CLIENT_ID}:{ACCESS_TOKEN}"}
+    params={"symbol":"NSE:NIFTYBANK-INDEX","strikecount":25,"greeks":"1"}
+    r=requests.get("https://api-t1.fyers.in/data/options-chain-v3",headers=headers,params=params,timeout=12)
+    r.raise_for_status()
+    chain=r.json().get("data",{}).get("optionsChain",[])
+    typ="CE" if signal=="CALL" else "PE"
+    legs=[x for x in chain if x.get("option_type")==typ and float(x.get("ltp",0) or 0)>0]
+    affordable=[x for x in legs if float(x["ltp"])*LOT_SIZE <= max_budget]
+    if not affordable: return None
+    chosen=min(affordable,key=lambda x:(abs(float(x["strike_price"])-spot),-float(x.get("ltp",0))))
+    premium=float(chosen["ltp"])
+    return {"symbol":chosen.get("symbol","—"),"premium":round(premium,2),"cost":round(premium*LOT_SIZE,2)}
+
 def make_levels(entry,signal):
     entry=float(entry)
     return round(entry*0.85,2),round(entry*1.25,2),round(entry*1.40,2)
@@ -213,51 +243,43 @@ def condition_class(value):
 
 @app.route("/")
 def home():
-    if not ACCESS_TOKEN:
-        return render_template_string(PAGE,signal="WAIT",cls="wait",score=0,spot="—",contract="—",entry="—",sl="—",t1="—",t2="—",exit_rule="Connect FYERS",note="FYERS is not connected.",strength="—",c1="—",c2="—",c3="—",c4="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",x1="—",x2="—",x3="—",x1_cls="neutral",x2_cls="neutral",x3_cls="neutral",price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—")
-
+    base=dict(signal="WAIT",cls="wait",score=0,spot="—",strength="—",
+        c1="—",c2="—",c3="—",c4="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",
+        x1="—",x2="—",x3="—",x1_cls="neutral",x2_cls="neutral",x3_cls="neutral",
+        price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—",adx="—",atr="—",candle_range="—",
+        sig_a="WAIT",sig_a_cls="wait",strength_a="—",score_a=0,contract_a="—",premium_a="—",cost_a="—",
+        sig_b="WAIT",sig_b_cls="wait",strength_b="—",score_b=0,contract_b="—",premium_b="—",cost_b="—",
+        sig_c="WAIT",sig_c_cls="wait",strength_c="—",score_c=0,contract_c="—",premium_c="—",cost_c="—",conf_c=0)
+    if not ACCESS_TOKEN: return render_template_string(PAGE,**base)
     try:
         fy=fyersModel.FyersModel(client_id=CLIENT_ID,token=ACCESS_TOKEN,is_async=False,log_path="")
-        now=datetime.now(timezone.utc)
-        start=now-timedelta(days=5)
+        now=datetime.now(timezone.utc); start=now-timedelta(days=5)
         response=fy.history({"symbol":"NSE:NIFTYBANK-INDEX","resolution":"5","date_format":"1","range_from":start.strftime("%Y-%m-%d"),"range_to":now.strftime("%Y-%m-%d"),"cont_flag":"1"})
         candles=response.get("candles",[])
-        if len(candles)<50: raise ValueError("Not enough 5-minute candles returned by FYERS.")
-
-        result=calc(candles)
-        sig=result["signal"]; score=result["score"]; spot=result["spot"]
-        contract="—"; entry=sl=t1=t2="—"; exit_rule="WAIT / no trade"
-        note="Technical signal only; not a guaranteed trade."
-
+        if len(candles)<60: raise ValueError("Not enough 5-minute candles returned by FYERS.")
+        result=calc(candles); sig=result["signal"]; score=result["score"]; spot=result["spot"]
+        cond=result["conditions"]; conf=result["confirmations"]; conf_count=sum(x=="PASS" for x in conf)
+        cards=[None,None]
         if sig in ("CALL","PUT"):
-            try:
-                selected=pick_budget_option(spot,sig)
-                if selected:
-                    contract=selected["symbol"]; entry=round(float(selected["premium"]),2)
-                    sl,t1,t2=make_levels(entry,sig)
-                    reverse_signal="PUT" if sig=="CALL" else "CALL"
-                    exit_rule=f"Exit at T1/T2 or immediately if signal reverses to {reverse_signal}."
-                    if selected.get("within"):
-                        note+=f" Budget premium target: ₹{MIN_PREMIUM:.0f}–₹{MAX_PREMIUM:.0f}."
-                    else: note+=" No contract was inside the preferred premium range."
-                else: note+=" No suitable option contract was returned."
-            except Exception as oe: note+=" Option-chain lookup failed: "+str(oe)
-
-        conditions=result["conditions"]
-        c1,c2,c3,c4=conditions
-
+            for i,budget in enumerate((2000,5000)):
+                try: cards[i]=pick_budget_option(spot,sig,budget)
+                except Exception: cards[i]=None
+        strongest=(sig in ("CALL","PUT") and abs(score)==4 and conf_count>=2)
+        citem=cards[1] if strongest and cards[1] else (cards[0] or cards[1])
+        def vals(item):
+            if not item: return ("WAIT","wait","—",0,"—","—","—")
+            return (sig,sig.lower(),result["strength"],abs(score),item["symbol"],item["premium"],item["cost"])
+        a,b,c=vals(cards[0]),vals(cards[1]),vals(citem)
         return render_template_string(PAGE,signal=sig,cls=sig.lower(),score=abs(score),strength=result["strength"],spot=round(spot,2),
-            contract=contract,entry=entry,sl=sl,t1=t1,t2=t2,exit_rule=exit_rule,note=note,
-            c1=c1,c2=c2,c3=c3,c4=c4,c1_cls=condition_class(c1),c2_cls=condition_class(c2),
-            c3_cls=condition_class(c3),c4_cls=condition_class(c4),x1=result["confirmations"][0],x2=result["confirmations"][1],x3=result["confirmations"][2],
-            x1_cls=condition_class(result["confirmations"][0]),x2_cls=condition_class(result["confirmations"][1]),x3_cls=condition_class(result["confirmations"][2]),
-            price=round(result["spot"],2),ema9=round(result["ema9"],2),ema21=round(result["ema21"],2),
-            vwap=round(result["vwap"],2),rsi=round(result["rsi"],2),volume=round(result["volume"],0),
-            avg_volume=round(result["avg_volume"],0),adx=round(result["adx"],1),atr=round(result["atr"],2),candle_range=round(result["candle_range"],2))
+            c1=cond[0],c2=cond[1],c3=cond[2],c4=cond[3],c1_cls=condition_class(cond[0]),c2_cls=condition_class(cond[1]),c3_cls=condition_class(cond[2]),c4_cls=condition_class(cond[3]),
+            x1=conf[0],x2=conf[1],x3=conf[2],x1_cls=condition_class(conf[0]),x2_cls=condition_class(conf[1]),x3_cls=condition_class(conf[2]),
+            price=round(result["spot"],2),ema9=round(result["ema9"],2),ema21=round(result["ema21"],2),vwap=round(result["vwap"],2),rsi=round(result["rsi"],2),volume=round(result["volume"],0),avg_volume=round(result["avg_volume"],0),adx=round(result["adx"],1),atr=round(result["atr"],2),candle_range=round(result["candle_range"],2),
+            sig_a=a[0],sig_a_cls=a[1],strength_a=a[2],score_a=a[3],contract_a=a[4],premium_a=a[5],cost_a=a[6],
+            sig_b=b[0],sig_b_cls=b[1],strength_b=b[2],score_b=b[3],contract_b=b[4],premium_b=b[5],cost_b=b[6],
+            sig_c=c[0],sig_c_cls=c[1],strength_c=c[2],score_c=c[3],contract_c=c[4],premium_c=c[5],cost_c=c[6],conf_c=conf_count)
     except Exception as e:
-        return render_template_string(PAGE,signal="WAIT",cls="wait",score=0,spot="—",contract="—",entry="—",sl="—",t1="—",t2="—",exit_rule="No trade",note="Data error: "+str(e),
-            strength="—",c1="—",c2="—",c3="—",c4="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",x1="—",x2="—",x3="—",x1_cls="neutral",x2_cls="neutral",x3_cls="neutral",
-            price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—")
+        base["signal"]="WAIT"
+        return render_template_string(PAGE,**base)
 
 @app.route("/login")
 def login():
@@ -287,4 +309,3 @@ def health(): return {"ok":True}
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
-        
