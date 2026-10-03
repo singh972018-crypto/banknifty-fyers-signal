@@ -30,7 +30,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="card"><b>🔄 Auto-refresh: ON</b><br><span class="small">Page refreshes every 5 minutes to fetch the latest signal.</span></div>
 <div class="card"><h3>🟢 LIVE ANALYSIS A — Budget band ₹2,000</h3>
 <div class="sig {{sig_a_cls}}">{{sig_a}}</div>
-<p><b>{{strength_a}}</b> &nbsp; Score: <b>{{score_a}}/4</b></p>
+<p><b>{{strength_a}}</b> &nbsp; Score: <b>{{score_a}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
 <div class="row"><span>Reference option</span><b>{{contract_a}}</b></div>
 <div class="row"><span>Live premium</span><b>₹{{premium_a}}</b></div>
@@ -39,7 +39,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 
 <div class="card"><h3>🔵 LIVE ANALYSIS B — Budget band ₹5,000</h3>
 <div class="sig {{sig_b_cls}}">{{sig_b}}</div>
-<p><b>{{strength_b}}</b> &nbsp; Score: <b>{{score_b}}/4</b></p>
+<p><b>{{strength_b}}</b> &nbsp; Score: <b>{{score_b}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
 <div class="row"><span>Reference option</span><b>{{contract_b}}</b></div>
 <div class="row"><span>Live premium</span><b>₹{{premium_b}}</b></div>
@@ -48,7 +48,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 
 <div class="card"><h3>🟣 LIVE ANALYSIS C — Highest-confidence setup</h3>
 <div class="sig {{sig_c_cls}}">{{sig_c}}</div>
-<p><b>{{strength_c}}</b> &nbsp; Score: <b>{{score_c}}/4</b></p>
+<p><b>{{strength_c}}</b> &nbsp; Score: <b>{{score_c}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
 <div class="row"><span>Reference option</span><b>{{contract_c}}</b></div>
 <div class="row"><span>Live premium</span><b>₹{{premium_c}}</b></div>
@@ -203,7 +203,11 @@ def pick_budget_option(spot, signal):
     r.raise_for_status()
     chain=r.json().get("data",{}).get("optionsChain",[])
     typ="CE" if signal=="CALL" else "PE"
-    legs=[x for x in chain if x.get("option_type")==typ and float(x.get("ltp",0) or 0)>0]
+    def is_type(x):
+        ot=str(x.get("option_type","")).upper()
+        sym=str(x.get("symbol","")).upper()
+        return ot==typ or sym.endswith(typ)
+    legs=[x for x in chain if is_type(x) and float(x.get("ltp",0) or 0)>0]
     in_range=[x for x in legs if MIN_PREMIUM<=float(x["ltp"])<=MAX_PREMIUM]
     candidates=in_range or legs
     if not candidates: return None
@@ -225,7 +229,11 @@ def pick_budget_option(spot, signal, max_budget):
     r.raise_for_status()
     chain=r.json().get("data",{}).get("optionsChain",[])
     typ="CE" if signal=="CALL" else "PE"
-    legs=[x for x in chain if x.get("option_type")==typ and float(x.get("ltp",0) or 0)>0]
+    def is_type(x):
+        ot=str(x.get("option_type","")).upper()
+        sym=str(x.get("symbol","")).upper()
+        return ot==typ or sym.endswith(typ)
+    legs=[x for x in chain if is_type(x) and float(x.get("ltp",0) or 0)>0]
     affordable=[x for x in legs if float(x["ltp"])*LOT_SIZE <= max_budget]
     if not affordable: return None
     chosen=min(affordable,key=lambda x:(abs(float(x["strike_price"])-spot),-float(x.get("ltp",0))))
@@ -266,10 +274,17 @@ def home():
                 except Exception: cards[i]=None
         strongest=(sig in ("CALL","PUT") and abs(score)==4 and conf_count>=2)
         citem=cards[1] if strongest and cards[1] else (cards[0] or cards[1])
-        def vals(item):
-            if not item: return ("WAIT","wait","—",0,"—","—","—")
-            return (sig,sig.lower(),result["strength"],abs(score),item["symbol"],item["premium"],item["cost"])
-        a,b,c=vals(cards[0]),vals(cards[1]),vals(citem)
+        def vals(item, budget):
+            # IMPORTANT: the signal comes from the live index indicators.
+            # Option-chain availability must NOT turn a valid CALL/PUT signal into WAIT.
+            if not item:
+                return (sig, sig.lower(), result["strength"], abs(score),
+                        f"No option ≤ ₹{budget:,}", "—", "—")
+            return (sig, sig.lower(), result["strength"], abs(score),
+                    item["symbol"], item["premium"], item["cost"])
+        a=vals(cards[0],2000)
+        b=vals(cards[1],5000)
+        c=vals(citem,5000 if strongest else 2000)
         return render_template_string(PAGE,signal=sig,cls=sig.lower(),score=abs(score),strength=result["strength"],spot=round(spot,2),
             c1=cond[0],c2=cond[1],c3=cond[2],c4=cond[3],c1_cls=condition_class(cond[0]),c2_cls=condition_class(cond[1]),c3_cls=condition_class(cond[2]),c4_cls=condition_class(cond[3]),
             x1=conf[0],x2=conf[1],x3=conf[2],x1_cls=condition_class(conf[0]),x2_cls=condition_class(conf[1]),x3_cls=condition_class(conf[2]),
