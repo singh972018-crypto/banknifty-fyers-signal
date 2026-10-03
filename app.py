@@ -46,7 +46,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="row"><span>Approx. 1-lot value</span><b>₹{{cost_b}}</b></div>
 <p class="small">Live-market reference only. No order placement is performed by this app.</p></div>
 
-<div class="card"><h3>🟣 LIVE ANALYSIS C — Highest-confidence setup</h3>
+<div class="card"><h3>🟣 LIVE ANALYSIS C — Highest-confidence / Unlimited premium</h3>
 <div class="sig {{sig_c_cls}}">{{sig_c}}</div>
 <p><b>{{strength_c}}</b> &nbsp; Score: <b>{{score_c}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
@@ -196,49 +196,52 @@ def calc(candles):
             "adx":adx,"atr":atr14,"candle_range":candle_range,
             "conditions":conditions,"confirmations":confirmations}
 
-def pick_budget_option(spot, signal):
+def pick_budget_option(spot, signal, max_premium=None):
+    """Select by option PREMIUM cap. None = unlimited premium for setup C."""
     headers={"Authorization":f"{CLIENT_ID}:{ACCESS_TOKEN}"}
     params={"symbol":"NSE:NIFTYBANK-INDEX","strikecount":25,"greeks":"1"}
-    r=requests.get("https://api-t1.fyers.in/data/options-chain-v3",headers=headers,params=params,timeout=12)
+    r=requests.get("https://api-t1.fyers.in/data/options-chain-v3",
+                   headers=headers,params=params,timeout=12)
     r.raise_for_status()
     chain=r.json().get("data",{}).get("optionsChain",[])
     typ="CE" if signal=="CALL" else "PE"
-    def is_type(x):
-        ot=str(x.get("option_type","")).upper()
-        sym=str(x.get("symbol","")).upper()
-        return ot==typ or sym.endswith(typ)
-    legs=[x for x in chain if is_type(x) and float(x.get("ltp",0) or 0)>0]
-    in_range=[x for x in legs if MIN_PREMIUM<=float(x["ltp"])<=MAX_PREMIUM]
-    candidates=in_range or legs
-    if not candidates: return None
-    if in_range:
-        chosen=min(in_range,key=lambda x:(abs(float(x["strike_price"])-spot),-float(x.get("volume",0))))
-        within=True
-    else:
-        mid=(MIN_PREMIUM+MAX_PREMIUM)/2
-        chosen=min(legs,key=lambda x:(abs(float(x["ltp"])-mid),abs(float(x["strike_price"])-spot)))
-        within=False
-    premium=float(chosen["ltp"])
-    return {"symbol":chosen.get("symbol","—"),"premium":round(premium,2),
-            "cost":round(premium*LOT_SIZE,2),"lot":LOT_SIZE,"within":within}
 
-def pick_budget_option(spot, signal, max_budget):
-    headers={"Authorization":f"{CLIENT_ID}:{ACCESS_TOKEN}"}
-    params={"symbol":"NSE:NIFTYBANK-INDEX","strikecount":25,"greeks":"1"}
-    r=requests.get("https://api-t1.fyers.in/data/options-chain-v3",headers=headers,params=params,timeout=12)
-    r.raise_for_status()
-    chain=r.json().get("data",{}).get("optionsChain",[])
-    typ="CE" if signal=="CALL" else "PE"
     def is_type(x):
         ot=str(x.get("option_type","")).upper()
         sym=str(x.get("symbol","")).upper()
         return ot==typ or sym.endswith(typ)
-    legs=[x for x in chain if is_type(x) and float(x.get("ltp",0) or 0)>0]
-    affordable=[x for x in legs if float(x["ltp"])*LOT_SIZE <= max_budget]
-    if not affordable: return None
-    chosen=min(affordable,key=lambda x:(abs(float(x["strike_price"])-spot),-float(x.get("ltp",0))))
-    premium=float(chosen["ltp"])
-    return {"symbol":chosen.get("symbol","—"),"premium":round(premium,2),"cost":round(premium*LOT_SIZE,2)}
+
+    legs=[]
+    for x in chain:
+        try:
+            premium=float(x.get("ltp",0) or 0)
+        except Exception:
+            premium=0
+        if is_type(x) and premium>0:
+            x["_premium"]=premium
+            legs.append(x)
+
+    if max_premium is not None:
+        legs=[x for x in legs if x["_premium"] <= float(max_premium)]
+
+    if not legs:
+        return None
+
+    # Prefer ATM/near-ATM first; use volume/OI as liquidity tie-breakers.
+    def key(x):
+        strike=float(x.get("strike_price",spot) or spot)
+        volume=float(x.get("volume",0) or 0)
+        oi=float(x.get("oi",0) or 0)
+        return (abs(strike-spot), -volume, -oi)
+
+    chosen=min(legs,key=key)
+    premium=chosen["_premium"]
+    return {
+        "symbol":chosen.get("symbol","—"),
+        "premium":round(premium,2),
+        "cost":round(premium*LOT_SIZE,2)
+    }
+
 
 def make_levels(entry,signal):
     entry=float(entry)
@@ -267,24 +270,30 @@ def home():
         if len(candles)<60: raise ValueError("Not enough 5-minute candles returned by FYERS.")
         result=calc(candles); sig=result["signal"]; score=result["score"]; spot=result["spot"]
         cond=result["conditions"]; conf=result["confirmations"]; conf_count=sum(x=="PASS" for x in conf)
-        cards=[None,None]
+        # A/B limits are OPTION PREMIUM limits, not total lot value.
+        # A: premium <= ₹2,000
+        # B: premium <= ₹5,000
+        # C: unlimited premium
+        cards=[None,None,None]
         if sig in ("CALL","PUT"):
-            for i,budget in enumerate((2000,5000)):
-                try: cards[i]=pick_budget_option(spot,sig,budget)
-                except Exception: cards[i]=None
-        strongest=(sig in ("CALL","PUT") and abs(score)==4 and conf_count>=2)
-        citem=cards[1] if strongest and cards[1] else (cards[0] or cards[1])
-        def vals(item, budget):
-            # IMPORTANT: the signal comes from the live index indicators.
-            # Option-chain availability must NOT turn a valid CALL/PUT signal into WAIT.
+            for i,cap in enumerate((2000,5000,None)):
+                try:
+                    cards[i]=pick_budget_option(spot,sig,cap)
+                except Exception:
+                    cards[i]=None
+
+        def vals(item, label):
+            # A missing option must never turn a valid index signal into WAIT.
             if not item:
                 return (sig, sig.lower(), result["strength"], abs(score),
-                        f"No option ≤ ₹{budget:,}", "—", "—")
+                        label, "—", "—")
             return (sig, sig.lower(), result["strength"], abs(score),
                     item["symbol"], item["premium"], item["cost"])
-        a=vals(cards[0],2000)
-        b=vals(cards[1],5000)
-        c=vals(citem,5000 if strongest else 2000)
+
+        a=vals(cards[0],"No option within ₹2,000 premium")
+        b=vals(cards[1],"No option within ₹5,000 premium")
+        c=vals(cards[2],"No suitable option returned")
+
         return render_template_string(PAGE,signal=sig,cls=sig.lower(),score=abs(score),strength=result["strength"],spot=round(spot,2),
             c1=cond[0],c2=cond[1],c3=cond[2],c4=cond[3],c1_cls=condition_class(cond[0]),c2_cls=condition_class(cond[1]),c3_cls=condition_class(cond[2]),c4_cls=condition_class(cond[3]),
             x1=conf[0],x2=conf[1],x3=conf[2],x1_cls=condition_class(conf[0]),x2_cls=condition_class(conf[1]),x3_cls=condition_class(conf[2]),
