@@ -37,7 +37,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="row"><span>Approx. 1-lot value</span><b>₹{{cost_a}}</b></div>
 <p class="small">Live-market reference only. No order placement is performed by this app.</p></div>
 
-<div class="card"><h3>🔵 LIVE ANALYSIS B — Premium ≤ ₹5,000 (different option)</h3>
+<div class="card"><h3>🔵 LIVE ANALYSIS B — 1-Lot Budget ₹2,001–₹5,000</h3>
 <div class="sig {{sig_b_cls}}">{{sig_b}}</div>
 <p><b>{{strength_b}}</b> &nbsp; Score: <b>{{score_b}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
@@ -46,7 +46,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="row"><span>Approx. 1-lot value</span><b>₹{{cost_b}}</b></div>
 <p class="small">Live-market reference only. No order placement is performed by this app.</p></div>
 
-<div class="card"><h3>🟣 LIVE ANALYSIS C — Highest-confidence / Unlimited premium (different option)</h3>
+<div class="card"><h3>🟣 LIVE ANALYSIS C — 1-Lot Budget ₹5,001+ / Unlimited</h3>
 <div class="sig {{sig_c_cls}}">{{sig_c}}</div>
 <p><b>{{strength_c}}</b> &nbsp; Score: <b>{{score_c}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
@@ -196,15 +196,14 @@ def calc(candles):
             "adx":adx,"atr":atr14,"candle_range":candle_range,
             "conditions":conditions,"confirmations":confirmations}
 
-def pick_budget_option(spot, signal, max_premium=None, exclude_symbols=None):
-    """Select a live option by premium cap, allowing distinct A/B/C contracts."""
+def pick_budget_option(spot, signal, min_cost=0, max_cost=None, exclude_symbols=None):
+    """Select by TOTAL 1-lot value = option premium × lot size."""
     headers={"Authorization":f"{CLIENT_ID}:{ACCESS_TOKEN}"}
     params={"symbol":"NSE:NIFTYBANK-INDEX","strikecount":25,"greeks":"1"}
     r=requests.get("https://api-t1.fyers.in/data/options-chain-v3",headers=headers,params=params,timeout=12)
     r.raise_for_status()
     chain=r.json().get("data",{}).get("optionsChain",[])
-    typ="CE" if signal=="CALL" else "PE"
-    excluded=set(exclude_symbols or [])
+    typ="CE" if signal=="CALL" else "PE"; excluded=set(exclude_symbols or [])
     def is_type(x):
         ot=str(x.get("option_type","")).upper(); sym=str(x.get("symbol","")).upper()
         return ot==typ or sym.endswith(typ)
@@ -214,15 +213,12 @@ def pick_budget_option(spot, signal, max_premium=None, exclude_symbols=None):
             premium=float(x.get("ltp",0) or 0); strike=float(x.get("strike_price",spot) or spot)
             volume=float(x.get("volume",0) or 0); oi=float(x.get("oi",0) or 0)
         except Exception: continue
-        symbol=x.get("symbol","—")
-        if is_type(x) and premium>0 and symbol not in excluded:
-            legs.append({"symbol":symbol,"premium":premium,"strike":strike,"volume":volume,"oi":oi})
-    if max_premium is not None: legs=[x for x in legs if x["premium"]<=float(max_premium)]
+        symbol=x.get("symbol","—"); total=premium*LOT_SIZE
+        if is_type(x) and premium>0 and symbol not in excluded and total>=float(min_cost) and (max_cost is None or total<=float(max_cost)):
+            legs.append({"symbol":symbol,"premium":premium,"total":total,"strike":strike,"volume":volume,"oi":oi})
     if not legs: return None
-    legs.sort(key=lambda x:(abs(x["strike"]-spot),-x["volume"],-x["oi"]))
-    x=legs[0]
-    return {"symbol":x["symbol"],"premium":round(x["premium"],2),"cost":round(x["premium"]*LOT_SIZE,2),"strike":x["strike"]}
-
+    x=min(legs,key=lambda z:(abs(z["strike"]-spot),-z["volume"],-z["oi"]))
+    return {"symbol":x["symbol"],"premium":round(x["premium"],2),"cost":round(x["total"],2),"strike":x["strike"]}
 
 def make_levels(entry,signal):
     entry=float(entry)
@@ -251,23 +247,23 @@ def home():
         if len(candles)<60: raise ValueError("Not enough 5-minute candles returned by FYERS.")
         result=calc(candles); sig=result["signal"]; score=result["score"]; spot=result["spot"]
         cond=result["conditions"]; conf=result["confirmations"]; conf_count=sum(x=="PASS" for x in conf)
-        # A/B/C deliberately use different contracts when available.
+        # A/B/C are TOTAL 1-LOT VALUE slabs: A ₹0–₹2,000; B ₹2,001–₹5,000; C ₹5,001+
         cards=[None,None,None]
         if sig in ("CALL","PUT"):
-            try: cards[0]=pick_budget_option(spot,sig,2000)
+            try: cards[0]=pick_budget_option(spot,sig,0,2000)
             except Exception: cards[0]=None
             ex_a=[cards[0]["symbol"]] if cards[0] else []
-            try: cards[1]=pick_budget_option(spot,sig,5000,ex_a)
+            try: cards[1]=pick_budget_option(spot,sig,2000.01,5000,ex_a)
             except Exception: cards[1]=None
             ex_ab=ex_a+([cards[1]["symbol"]] if cards[1] else [])
-            try: cards[2]=pick_budget_option(spot,sig,None,ex_ab)
+            try: cards[2]=pick_budget_option(spot,sig,5000.01,None,ex_ab)
             except Exception: cards[2]=None
         def vals(item,label):
             if not item: return (sig,sig.lower(),result["strength"],abs(score),label,"—","—")
             return (sig,sig.lower(),result["strength"],abs(score),item["symbol"],item["premium"],item["cost"])
-        a=vals(cards[0],"No option within ₹2,000 premium")
-        b=vals(cards[1],"No different option within ₹5,000 premium")
-        c=vals(cards[2],"No different unlimited-premium option returned")
+        a=vals(cards[0],"No option in ₹0–₹2,000 / 1 lot")
+        b=vals(cards[1],"No option in ₹2,001–₹5,000 / 1 lot")
+        c=vals(cards[2],"No option above ₹5,000 / 1 lot")
         return render_template_string(PAGE,signal=sig,cls=sig.lower(),score=abs(score),strength=result["strength"],spot=round(spot,2),
             c1=cond[0],c2=cond[1],c3=cond[2],c4=cond[3],c1_cls=condition_class(cond[0]),c2_cls=condition_class(cond[1]),c3_cls=condition_class(cond[2]),c4_cls=condition_class(cond[3]),
             x1=conf[0],x2=conf[1],x3=conf[2],x1_cls=condition_class(conf[0]),x2_cls=condition_class(conf[1]),x3_cls=condition_class(conf[2]),
