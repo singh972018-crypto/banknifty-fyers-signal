@@ -1,305 +1,209 @@
-import os
+import os, math, logging
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request, redirect, render_template_string
-import requests
-from fyers_apiv3 import fyersModel
+from zoneinfo import ZoneInfo
+from flask import Flask, jsonify, render_template_string
+
+try:
+    from fyers_apiv3 import fyersModel
+except Exception:
+    fyersModel = None
 
 app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-this-secret")
+logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
+log = logging.getLogger("banknifty3m")
+FYERS_CLIENT_ID = os.getenv("FYERS_CLIENT_ID", "").strip()
+FYERS_ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN", "").strip()
+# Retained for compatibility with existing hosting environment:
+FYERS_SECRET = os.getenv("FYERS_SECRET", "").strip()
+FYERS_REDIRECT_URI = os.getenv("FYERS_REDIRECT_URI", "").strip()
+MIN_PREMIUM = float(os.getenv("MIN_PREMIUM", "30"))
+MAX_PREMIUM = float(os.getenv("MAX_PREMIUM", "65"))
+USE_PREMIUM_FILTER = os.getenv("USE_PREMIUM_FILTER", "false").strip().lower() in ("1","true","yes","on")
+BANKNIFTY_LOT_SIZE = int(os.getenv("BANKNIFTY_LOT_SIZE", "30"))
+HISTORY_DAYS = max(2, min(10, int(os.getenv("FYERS_HISTORY_DAYS", "5"))))
+TIMEFRAME, CANDLE_SECONDS = "3", 180
+INDEX_SYMBOL = "NSE:NIFTYBANK-INDEX"
+IST = ZoneInfo("Asia/Kolkata")
 
-CLIENT_ID=os.getenv("FYERS_CLIENT_ID","")
-SECRET=os.getenv("FYERS_SECRET","")
-REDIRECT_URI=os.getenv("FYERS_REDIRECT_URI", os.getenv("RENDER_EXTERNAL_URL","").rstrip("/") + "/callback")
-ACCESS_TOKEN=os.getenv("FYERS_ACCESS_TOKEN","")
-MIN_PREMIUM=float(os.getenv("MIN_PREMIUM","30"))
-MAX_PREMIUM=float(os.getenv("MAX_PREMIUM","65"))
-LOT_SIZE=int(os.getenv("BANKNIFTY_LOT_SIZE","30"))
+def now_ist():
+    return datetime.now(IST)
 
-PAGE="""<!doctype html>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="300">
-<style>
-body{font-family:Arial;background:#111;color:#eee;padding:18px}
-.card{background:#1d1d1d;padding:20px;border-radius:16px;margin-bottom:12px}
-.sig{font-size:44px;font-weight:bold}.call{color:#35d07f}.put{color:#ff5c6c}.wait{color:#bbb}
-.row{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #333}
-.pass{color:#35d07f;font-weight:bold}.fail{color:#ff5c6c;font-weight:bold}.neutral{color:#bbb}
-.small{color:#aaa;font-size:13px}.debug{font-size:14px;line-height:1.5}
-a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:none}
-</style>
-<h2>BankNifty 5M Signal</h2>
-<div class="card"><b>🔄 Auto-refresh: ON</b><br><span class="small">Page refreshes every 5 minutes to fetch the latest signal.</span></div>
-<div class="card"><h3>🟢 LIVE ANALYSIS A — Budget band ₹2,000</h3>
-<div class="sig {{sig_a_cls}}">{{sig_a}}</div>
-<p><b>{{strength_a}}</b> &nbsp; Score: <b>{{score_a}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
-<div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
-<div class="row"><span>Reference option</span><b>{{contract_a}}</b></div>
-<div class="row"><span>Live premium</span><b>₹{{premium_a}}</b></div>
-<div class="row"><span>Approx. 1-lot value</span><b>₹{{cost_a}}</b></div>
-<p class="small">Live-market reference only. No order placement is performed by this app.</p></div>
+def num(v, default=None):
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else default
+    except (TypeError, ValueError, OverflowError):
+        return default
 
-<div class="card"><h3>🔵 LIVE ANALYSIS B — 1-Lot Budget ₹2,001–₹5,000</h3>
-<div class="sig {{sig_b_cls}}">{{sig_b}}</div>
-<p><b>{{strength_b}}</b> &nbsp; Score: <b>{{score_b}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
-<div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
-<div class="row"><span>Reference option</span><b>{{contract_b}}</b></div>
-<div class="row"><span>Live premium</span><b>₹{{premium_b}}</b></div>
-<div class="row"><span>Approx. 1-lot value</span><b>₹{{cost_b}}</b></div>
-<p class="small">Live-market reference only. No order placement is performed by this app.</p></div>
+def money(v):
+    v = num(v)
+    return "—" if v is None else f"{v:,.2f}"
 
-<div class="card"><h3>🟣 LIVE ANALYSIS C — 1-Lot Budget ₹5,001+ / Unlimited</h3>
-<div class="sig {{sig_c_cls}}">{{sig_c}}</div>
-<p><b>{{strength_c}}</b> &nbsp; Score: <b>{{score_c}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
-<div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
-<div class="row"><span>Reference option</span><b>{{contract_c}}</b></div>
-<div class="row"><span>Live premium</span><b>₹{{premium_c}}</b></div>
-<div class="row"><span>Approx. 1-lot value</span><b>₹{{cost_c}}</b></div>
-<div class="row"><span>Confirmation score</span><b>{{conf_c}}/3</b></div>
-<p class="small">Chosen from the live indicator/confirmation score; this is not a prediction of future price.</p></div>
-<div class="card"><h3>📊 4 Core Signal Conditions</h3>
-<div class="debug">
-<div class="row"><span>1. EMA 9 / EMA 21 Trend</span><b class="{{c1_cls}}">{{c1}}</b></div>
-<div class="row"><span>2. Price vs VWAP</span><b class="{{c2_cls}}">{{c2}}</b></div>
-<div class="row"><span>3. RSI Momentum</span><b class="{{c3_cls}}">{{c3}}</b></div>
-<div class="row"><span>4. Volume Confirmation</span><b class="{{c4_cls}}">{{c4}}</b></div>
-</div></div>
-<div class="card"><h3>🧭 Strength Confirmations</h3>
-<div class="row"><span>ADX + DI Trend Strength</span><b class="{{x1_cls}}">{{x1}}</b></div>
-<div class="row"><span>Candle Confirmation</span><b class="{{x2_cls}}">{{x2}}</b></div>
-<div class="row"><span>ATR Volatility</span><b class="{{x3_cls}}">{{x3}}</b></div>
-</div>
-<div class="card"><h3>📈 Indicator Data</h3>
-<div class="row"><span>Price</span><b>{{price}}</b></div>
-<div class="row"><span>EMA 9</span><b>{{ema9}}</b></div>
-<div class="row"><span>EMA 21</span><b>{{ema21}}</b></div>
-<div class="row"><span>VWAP</span><b>{{vwap}}</b></div>
-<div class="row"><span>RSI</span><b>{{rsi}}</b></div>
-<div class="row"><span>Current Volume</span><b>{{volume}}</b></div>
-<div class="row"><span>Average Volume</span><b>{{avg_volume}}</b></div>
-<div class="row"><span>ADX</span><b>{{adx}}</b></div>
-<div class="row"><span>ATR</span><b>{{atr}}</b></div>
-<div class="row"><span>Candle Range</span><b>{{candle_range}}</b></div>
-</div>
-<div class="card"><p>Technical signal only; not a guaranteed trade.</p>
-<p class="small">Levels are estimates from the current option premium and 5-minute signal; not guaranteed execution prices.</p></div>
-<br><a href="/login">Connect FYERS</a>
-"""
+@app.template_filter("money")
+def money_filter(v):
+    return money(v)
 
-def ema(values, period):
-    if not values: return 0.0
-    k=2/(period+1)
-    e=float(values[0])
-    for x in values[1:]:
-        e=float(x)*k+e*(1-k)
-    return e
+def make_fyers():
+    if fyersModel is None:
+        raise RuntimeError("Missing fyers-apiv3 package.")
+    if not FYERS_CLIENT_ID or not FYERS_ACCESS_TOKEN:
+        raise RuntimeError("Set FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN in hosting environment.")
+    return fyersModel.FyersModel(client_id=FYERS_CLIENT_ID, token=FYERS_ACCESS_TOKEN, log_path="")
 
-def calc(candles):
-    close=[float(x[4]) for x in candles]
-    high=[float(x[2]) for x in candles]
-    low=[float(x[3]) for x in candles]
-    volume=[float(x[5]) for x in candles]
-    if len(close)<60:
-        raise ValueError("Not enough 5-minute candles for signal calculation.")
+def api_error(data, fallback="FYERS request failed"):
+    return str(data.get("message") or data.get("error") or fallback) if isinstance(data, dict) else fallback
 
-    price=close[-1]
-    e9=ema(close[-60:],9)
-    e21=ema(close[-60:],21)
-
-    # Session-style VWAP from the returned candles.
-    typical=[(h+l+c)/3 for h,l,c in zip(high,low,close)]
-    total_volume=sum(volume)
-    vwap=sum(tp*v for tp,v in zip(typical,volume))/total_volume if total_volume else price
-
-    # RSI(14), using the same simple-average method as the original project.
-    changes=[close[i]-close[i-1] for i in range(1,len(close))]
-    recent=changes[-14:]
-    gains=sum(max(x,0) for x in recent)/14
-    losses=sum(max(-x,0) for x in recent)/14
-    rsi=100.0 if losses==0 else 100-(100/(1+gains/losses))
-
-    # Volume confirmation against the previous 20 completed candles.
-    current_volume=volume[-1]
-    avg_volume=sum(volume[-21:-1])/20 if len(volume)>=21 else sum(volume)/len(volume)
-
-    # ADX(14) -- trend-strength filter.
-    tr=[]; plus_dm=[]; minus_dm=[]
-    for i in range(1,len(close)):
-        up=high[i]-high[i-1]
-        down=low[i-1]-low[i]
-        tr.append(max(high[i]-low[i],abs(high[i]-close[i-1]),abs(low[i]-close[i-1])))
-        plus_dm.append(up if up>down and up>0 else 0.0)
-        minus_dm.append(down if down>up and down>0 else 0.0)
-    n=14
-    if len(tr)>=n:
-        atr14=sum(tr[-n:])/n
-        pdi=100*(sum(plus_dm[-n:])/n)/(atr14 or 1)
-        mdi=100*(sum(minus_dm[-n:])/n)/(atr14 or 1)
-        dx=100*abs(pdi-mdi)/(pdi+mdi) if (pdi+mdi) else 0.0
-        # A compact rolling ADX estimate from the latest 14 DX values.
-        dxs=[]
-        for j in range(max(n-1,len(tr)-n),len(tr)):
-            a=max(0,j-n+1); b=j+1
-            atr=sum(tr[a:b])/len(tr[a:b]) or 1
-            p=100*(sum(plus_dm[a:b])/len(plus_dm[a:b]))/atr
-            m=100*(sum(minus_dm[a:b])/len(minus_dm[a:b]))/atr
-            dxs.append(100*abs(p-m)/(p+m) if p+m else 0.0)
-        adx=sum(dxs)/len(dxs) if dxs else dx
-    else:
-        atr14=0.0; pdi=mdi=adx=0.0
-
-    # ATR as a volatility filter. Compare current candle range with ATR.
-    candle_range=high[-1]-low[-1]
-    atr_ok=candle_range >= atr14*0.60 if atr14>0 else True
-
-    # Candle confirmation: body direction + close location.
-    body=abs(close[-1]-close[-2])
-    bull_candle=close[-1]>close[-2] and body >= candle_range*0.35 if candle_range>0 else False
-    bear_candle=close[-1]<close[-2] and body >= candle_range*0.35 if candle_range>0 else False
-
-    # Core indicators + strength confirmations.
-    core_call=[e9>e21,price>vwap,rsi>=52,current_volume>avg_volume]
-    core_put=[e9<e21,price<vwap,rsi<=48,current_volume>avg_volume]
-    call_score=sum(core_call); put_score=sum(core_put)
-
-    # ADX confirms trend direction; candle confirms immediate price action;
-    # ATR confirms enough movement. These are confirmations, not extra core votes.
-    call_confirmations=[adx>=20 and pdi>mdi,bull_candle,atr_ok]
-    put_confirmations=[adx>=20 and mdi>pdi,bear_candle,atr_ok]
-    call_conf=sum(call_confirmations); put_conf=sum(put_confirmations)
-
-    # Require 3/4 core conditions. Then use confirmations to classify strength.
-    if call_score>=3 and call_score>put_score:
-        signal="CALL"
-        strength="STRONG" if call_score==4 and call_conf>=2 else ("NORMAL" if call_conf>=1 else "CAUTION")
-        score=call_score
-        conditions=["PASS" if x else "FAIL" for x in core_call]
-        confirmations=["PASS" if x else "FAIL" for x in call_confirmations]
-    elif put_score>=3 and put_score>call_score:
-        signal="PUT"
-        strength="STRONG" if put_score==4 and put_conf>=2 else ("NORMAL" if put_conf>=1 else "CAUTION")
-        score=-put_score
-        conditions=["PASS" if x else "FAIL" for x in core_put]
-        confirmations=["PASS" if x else "FAIL" for x in put_confirmations]
-    else:
-        signal="WAIT"
-        score=call_score if call_score>=put_score else -put_score
-        conditions=[]
-        for i in range(4):
-            if core_call[i] and not core_put[i]: conditions.append("CALL PASS")
-            elif core_put[i] and not core_call[i]: conditions.append("PUT PASS")
-            else: conditions.append("FAIL")
-        confirmations=["—","—","—"]
-        strength="WATCH"
-
-    return {"signal":signal,"score":score,"strength":strength,"spot":price,
-            "ema9":e9,"ema21":e21,"vwap":vwap,"rsi":rsi,
-            "volume":current_volume,"avg_volume":avg_volume,
-            "adx":adx,"atr":atr14,"candle_range":candle_range,
-            "conditions":conditions,"confirmations":confirmations}
-
-def pick_budget_option(spot, signal, min_cost=0, max_cost=None, exclude_symbols=None):
-    """Select by TOTAL 1-lot value = option premium × lot size."""
-    headers={"Authorization":f"{CLIENT_ID}:{ACCESS_TOKEN}"}
-    params={"symbol":"NSE:NIFTYBANK-INDEX","strikecount":25,"greeks":"1"}
-    r=requests.get("https://api-t1.fyers.in/data/options-chain-v3",headers=headers,params=params,timeout=12)
-    r.raise_for_status()
-    chain=r.json().get("data",{}).get("optionsChain",[])
-    typ="CE" if signal=="CALL" else "PE"; excluded=set(exclude_symbols or [])
-    def is_type(x):
-        ot=str(x.get("option_type","")).upper(); sym=str(x.get("symbol","")).upper()
-        return ot==typ or sym.endswith(typ)
-    legs=[]
-    for x in chain:
+def fetch_candles():
+    fy = make_fyers()
+    end = now_ist()
+    start = end - timedelta(days=HISTORY_DAYS)
+    data = fy.history({"symbol": INDEX_SYMBOL, "resolution": TIMEFRAME, "date_format": "1",
+        "range_from": start.strftime("%Y-%m-%d"), "range_to": end.strftime("%Y-%m-%d"), "cont_flag": "1"})
+    if not isinstance(data, dict) or data.get("s") != "ok":
+        raise RuntimeError(api_error(data, "Could not fetch 3-minute candles."))
+    now_epoch, unique, invalid = int(datetime.now(timezone.utc).timestamp()), {}, 0
+    for row in data.get("candles") or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            invalid += 1
+            continue
         try:
-            premium=float(x.get("ltp",0) or 0); strike=float(x.get("strike_price",spot) or spot)
-            volume=float(x.get("volume",0) or 0); oi=float(x.get("oi",0) or 0)
-        except Exception: continue
-        symbol=x.get("symbol","—"); total=premium*LOT_SIZE
-        if is_type(x) and premium>0 and symbol not in excluded and total>=float(min_cost) and (max_cost is None or total<=float(max_cost)):
-            legs.append({"symbol":symbol,"premium":premium,"total":total,"strike":strike,"volume":volume,"oi":oi})
-    if not legs: return None
-    x=min(legs,key=lambda z:(abs(z["strike"]-spot),-z["volume"],-z["oi"]))
-    return {"symbol":x["symbol"],"premium":round(x["premium"],2),"cost":round(x["total"],2),"strike":x["strike"]}
+            ts = int(row[0])
+            opn, high, low, close, volume = [num(x) for x in row[1:6]]
+            if any(x is None for x in (opn, high, low, close, volume)):
+                invalid += 1
+                continue
+            if min(opn, high, low, close) <= 0 or high < max(opn, close, low) or low > min(opn, close, high):
+                invalid += 1
+                continue
+            # FYERS timestamps are treated as candle-open timestamps.
+            if ts + CANDLE_SECONDS > now_epoch:
+                continue
+            unique[ts] = {"ts":ts, "open":opn, "high":high, "low":low, "close":close, "volume":max(0.0,volume)}
+        except (TypeError, ValueError, OverflowError):
+            invalid += 1
+    candles = sorted(unique.values(), key=lambda c:c["ts"])
+    if len(candles) < 35:
+        raise RuntimeError(f"Only {len(candles)} valid completed 3-minute candles; need 35.")
+    last = candles[-1]
+    age = max(0, now_epoch - (last["ts"] + CANDLE_SECONDS))
+    current = now_ist()
+    in_session = current.weekday() < 5 and (current.hour,current.minute) >= (9,15) and (current.hour,current.minute) <= (15,30)
+    if in_session and age > 12*60:
+        raise RuntimeError(f"Latest candle is stale ({age//60} minutes old); check FYERS data.")
+    log.info("Accepted candles=%d invalid_rows=%d latest_age_sec=%d", len(candles), invalid, age)
+    return candles
 
-def make_levels(entry,signal):
-    entry=float(entry)
-    return round(entry*0.85,2),round(entry*1.25,2),round(entry*1.40,2)
+def ema(xs, period):
+    if len(xs) < period: return None
+    alpha, value = 2/(period+1), sum(xs[:period])/period
+    for x in xs[period:]: value = alpha*x + (1-alpha)*value
+    return value
 
-def condition_class(value):
-    if value=="PASS" or "PASS" in value: return "pass"
-    if value=="FAIL": return "fail"
-    return "neutral"
+def rsi(xs, period=14):
+    if len(xs) <= period: return None
+    changes = [xs[i]-xs[i-1] for i in range(1,len(xs))]
+    gains, losses = [max(x,0) for x in changes], [max(-x,0) for x in changes]
+    ag, al = sum(gains[:period])/period, sum(losses[:period])/period
+    for i in range(period,len(changes)):
+        ag, al = (ag*(period-1)+gains[i])/period, (al*(period-1)+losses[i])/period
+    if al == 0: return 100.0 if ag > 0 else 50.0
+    return 100-100/(1+ag/al)
+
+def atr(cs, period=14):
+    tr = []
+    for i in range(1,len(cs)):
+        c, prev = cs[i], cs[i-1]
+        tr.append(max(c["high"]-c["low"], abs(c["high"]-prev["close"]), abs(c["low"]-prev["close"])))
+    return sum(tr[-period:])/period if len(tr) >= period else None
+
+def adx_estimate(cs, period=14):
+    plus, minus, trs = [], [], []
+    for i in range(1,len(cs)):
+        c, prev = cs[i], cs[i-1]
+        up, down = c["high"]-prev["high"], prev["low"]-c["low"]
+        plus.append(up if up > down and up > 0 else 0.0)
+        minus.append(down if down > up and down > 0 else 0.0)
+        trs.append(max(c["high"]-c["low"], abs(c["high"]-prev["close"]), abs(c["low"]-prev["close"])))
+    dx = []
+    for end in range(period-1,len(trs)):
+        start = end-period+1
+        total = sum(trs[start:end+1])
+        if total <= 0: continue
+        pd = 100*sum(plus[start:end+1])/total
+        md = 100*sum(minus[start:end+1])/total
+        dx.append(100*abs(pd-md)/(pd+md) if pd+md else 0.0)
+    return sum(dx[-period:])/period if len(dx) >= period else None
+
+def session_vwap(cs):
+    day = datetime.fromtimestamp(cs[-1]["ts"],timezone.utc).astimezone(IST).date()
+    today = [c for c in cs if datetime.fromtimestamp(c["ts"],timezone.utc).astimezone(IST).date() == day]
+    volume = sum(c["volume"] for c in today)
+    if volume <= 0: return None
+    return sum(((c["high"]+c["low"]+c["close"])/3)*c["volume"] for c in today)/volume
+
+def analyze(cs):
+    closes, last = [c["close"] for c in cs], cs[-1]
+    e9, e21, rv, av, dx, vw = ema(closes,9), ema(closes,21), rsi(closes), atr(cs), adx_estimate(cs), session_vwap(cs)
+    if any(x is None for x in (e9,e21,rv,av,dx)) or av <= 0:
+        raise RuntimeError("Indicators incomplete; wait for more valid candles.")
+    bull = bear = 0
+    checks = []
+    if e9 > e21: bull += 1; checks.append(("EMA 9/21","Short EMA above long EMA","good"))
+    elif e9 < e21: bear += 1; checks.append(("EMA 9/21","Short EMA below long EMA","bad"))
+    else: checks.append(("EMA 9/21","EMAs equal","neutral"))
+    if vw is None: checks.append(("Session VWAP","Unavailable: index volume missing/zero","neutral"))
+    elif last["close"] > vw: bull += 1; checks.append(("Session VWAP","Close above VWAP","good"))
+    elif last["close"] < vw: bear += 1; checks.append(("Session VWAP","Close below VWAP","bad"))
+    else: checks.append(("Session VWAP","Close at VWAP","neutral"))
+    if 52 <= rv <= 68: bull += 1; checks.append(("RSI 14",f"{rv:.1f}: moderate positive momentum","good"))
+    elif 32 <= rv <= 48: bear += 1; checks.append(("RSI 14",f"{rv:.1f}: moderate negative momentum","bad"))
+    else: checks.append(("RSI 14",f"{rv:.1f}: neutral/extended","neutral"))
+    if dx >= 18 and e9 != e21:
+        if e9 > e21: bull += 1; checks.append(("ADX estimate",f"{dx:.1f}: trend-strength filter active","good"))
+        else: bear += 1; checks.append(("ADX estimate",f"{dx:.1f}: trend-strength filter active","bad"))
+    else: checks.append(("ADX estimate",f"{dx:.1f}: weak/unclear trend","neutral"))
+    if last["high"]-last["low"] > 1.8*av: checks.append(("Candle range","Unusually wide; volatility elevated","neutral"))
+    else: checks.append(("Candle range","Within broad recent range","neutral"))
+    bias = "BULLISH BIAS" if bull >= 3 and bull > bear else "BEARISH BIAS" if bear >= 3 and bear > bull else "NEUTRAL / MIXED"
+    dt = datetime.fromtimestamp(last["ts"],timezone.utc).astimezone(IST)
+    age = max(0,int(datetime.now(timezone.utc).timestamp())-(last["ts"]+CANDLE_SECONDS))
+    return {"bias":bias,"bull":bull,"bear":bear,"spot":last["close"],"ema9":e9,"ema21":e21,
+        "rsi":rv,"atr":av,"adx":dx,"vwap":vw,"checks":checks,"count":len(cs),
+        "time":dt.strftime("%d-%b-%Y %I:%M:%S %p IST"),"age":round(age/60,1),"volume":last["volume"]}
+
+HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="45"><title>BankNifty 3-Minute Study</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0b1220;color:#edf3ff;font:15px/1.5 system-ui,sans-serif}main{max-width:1100px;margin:auto;padding:18px}
+header,.grid{display:flex;gap:12px;flex-wrap:wrap;justify-content:space-between}.grid{margin:14px 0}.card{background:#121c2e;border:1px solid #26354c;border-radius:13px;padding:15px;flex:1;min-width:245px}
+h1{font-size:24px;margin:0}h2{font-size:17px;margin:0 0 10px}.muted,.label,.foot{color:#9fb0c8}.label{font-size:12px}.signal{font-size:27px;font-weight:800}.good{color:#4ade80}.bad{color:#fb7185}.neutral{color:#fbbf24}
+.metrics{display:flex;gap:8px;flex-wrap:wrap}.metric{background:#0d1727;padding:9px;border-radius:8px;flex:1;min-width:105px}.value{font-size:17px;font-weight:650;overflow-wrap:anywhere}
+table{width:100%;border-collapse:collapse}td{border-bottom:1px solid #26354c;padding:8px 5px;font-size:13px}.error{border-color:#7f1d1d;color:#fecaca}.small,.foot{font-size:12px}.pill{border:1px solid #26354c;border-radius:20px;padding:5px 9px}a{color:#7dd3fc}.notice{padding:10px;border:1px solid #67521a;background:#211c0e;border-radius:9px;color:#f6d98b;margin:14px 0}
+</style></head><body><main><header><div><h1>BankNifty 3-Minute Study Dashboard</h1><div class="muted">Completed 3-minute candles · educational analysis only</div></div><div><span class="pill">Timeframe: 3m</span> <a href="/">Refresh now</a></div></header>
+<div class="notice">For learning and observation only. A directional bias is not a prediction or a trading recommendation.</div>
+{% if error %}<section class="card error"><h2>Data/API error</h2>{{error}}<p class="small">No analysis is shown when data is invalid or unavailable.</p></section>{% endif %}
+{% if r %}<div class="grid"><section class="card"><div class="label">Market-study reading</div><div class="signal {% if r.bias == 'BULLISH BIAS' %}good{% elif r.bias == 'BEARISH BIAS' %}bad{% else %}neutral{% endif %}">{{r.bias}}</div><div class="muted">Bullish checks {{r.bull}} · Bearish checks {{r.bear}}</div><p class="small">Latest completed candle: {{r.time}}</p><p class="small">Candle age: {{r.age}} min</p></section>
+<section class="card"><h2>Index data</h2><div class="metrics"><div class="metric"><div class="label">Last close</div><div class="value">{{r.spot|money}}</div></div><div class="metric"><div class="label">ATR 14</div><div class="value">{{r.atr|money}}</div></div><div class="metric"><div class="label">Latest volume</div><div class="value">{{r.volume|int}}</div></div><div class="metric"><div class="label">Candles loaded</div><div class="value">{{r.count}}</div></div></div></section></div>
+<div class="grid"><section class="card"><h2>Indicators</h2><table><tr><td>EMA 9</td><td>{{r.ema9|money}}</td></tr><tr><td>EMA 21</td><td>{{r.ema21|money}}</td></tr><tr><td>RSI 14</td><td>{{r.rsi|money}}</td></tr><tr><td>Session VWAP</td><td>{{r.vwap|money}}</td></tr><tr><td>ADX estimate</td><td>{{r.adx|money}}</td></tr></table><p class="small">VWAP is unavailable if the index feed has no usable volume.</p></section>
+<section class="card"><h2>Indicator checks</h2><table>{% for name,val,status in r.checks %}<tr><td>{{name}}</td><td class="{{status}}">{{val}}</td></tr>{% endfor %}</table></section></div>{% endif %}
+<p class="foot">Auto-refreshes every 45 seconds; this does not create a new candle every refresh. Indicators may be wrong and data can be delayed. No option contracts, entry/exit levels, or order placement are provided.</p></main></body></html>'''
 
 @app.route("/")
 def home():
-    base=dict(signal="WAIT",cls="wait",score=0,spot="—",strength="—",
-        c1="—",c2="—",c3="—",c4="—",c1_cls="neutral",c2_cls="neutral",c3_cls="neutral",c4_cls="neutral",
-        x1="—",x2="—",x3="—",x1_cls="neutral",x2_cls="neutral",x3_cls="neutral",
-        price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—",adx="—",atr="—",candle_range="—",
-        sig_a="WAIT",sig_a_cls="wait",strength_a="—",score_a=0,contract_a="—",premium_a="—",cost_a="—",
-        sig_b="WAIT",sig_b_cls="wait",strength_b="—",score_b=0,contract_b="—",premium_b="—",cost_b="—",
-        sig_c="WAIT",sig_c_cls="wait",strength_c="—",score_c=0,contract_c="—",premium_c="—",cost_c="—",conf_c=0)
-    if not ACCESS_TOKEN: return render_template_string(PAGE,**base)
+    result, error = None, None
     try:
-        fy=fyersModel.FyersModel(client_id=CLIENT_ID,token=ACCESS_TOKEN,is_async=False,log_path="")
-        now=datetime.now(timezone.utc); start=now-timedelta(days=5)
-        response=fy.history({"symbol":"NSE:NIFTYBANK-INDEX","resolution":"5","date_format":"1","range_from":start.strftime("%Y-%m-%d"),"range_to":now.strftime("%Y-%m-%d"),"cont_flag":"1"})
-        candles=response.get("candles",[])
-        if len(candles)<60: raise ValueError("Not enough 5-minute candles returned by FYERS.")
-        result=calc(candles); sig=result["signal"]; score=result["score"]; spot=result["spot"]
-        cond=result["conditions"]; conf=result["confirmations"]; conf_count=sum(x=="PASS" for x in conf)
-        # A/B/C are TOTAL 1-LOT VALUE slabs: A ₹0–₹2,000; B ₹2,001–₹5,000; C ₹5,001+
-        cards=[None,None,None]
-        if sig in ("CALL","PUT"):
-            try: cards[0]=pick_budget_option(spot,sig,0,2000)
-            except Exception: cards[0]=None
-            ex_a=[cards[0]["symbol"]] if cards[0] else []
-            try: cards[1]=pick_budget_option(spot,sig,2000.01,5000,ex_a)
-            except Exception: cards[1]=None
-            ex_ab=ex_a+([cards[1]["symbol"]] if cards[1] else [])
-            try: cards[2]=pick_budget_option(spot,sig,5000.01,None,ex_ab)
-            except Exception: cards[2]=None
-        def vals(item,label):
-            if not item: return (sig,sig.lower(),result["strength"],abs(score),label,"—","—")
-            return (sig,sig.lower(),result["strength"],abs(score),item["symbol"],item["premium"],item["cost"])
-        a=vals(cards[0],"No option in ₹0–₹2,000 / 1 lot")
-        b=vals(cards[1],"No option in ₹2,001–₹5,000 / 1 lot")
-        c=vals(cards[2],"No option above ₹5,000 / 1 lot")
-        return render_template_string(PAGE,signal=sig,cls=sig.lower(),score=abs(score),strength=result["strength"],spot=round(spot,2),
-            c1=cond[0],c2=cond[1],c3=cond[2],c4=cond[3],c1_cls=condition_class(cond[0]),c2_cls=condition_class(cond[1]),c3_cls=condition_class(cond[2]),c4_cls=condition_class(cond[3]),
-            x1=conf[0],x2=conf[1],x3=conf[2],x1_cls=condition_class(conf[0]),x2_cls=condition_class(conf[1]),x3_cls=condition_class(conf[2]),
-            price=round(result["spot"],2),ema9=round(result["ema9"],2),ema21=round(result["ema21"],2),vwap=round(result["vwap"],2),rsi=round(result["rsi"],2),volume=round(result["volume"],0),avg_volume=round(result["avg_volume"],0),adx=round(result["adx"],1),atr=round(result["atr"],2),candle_range=round(result["candle_range"],2),
-            sig_a=a[0],sig_a_cls=a[1],strength_a=a[2],score_a=a[3],contract_a=a[4],premium_a=a[5],cost_a=a[6],
-            sig_b=b[0],sig_b_cls=b[1],strength_b=b[2],score_b=b[3],contract_b=b[4],premium_b=b[5],cost_b=b[6],
-            sig_c=c[0],sig_c_cls=c[1],strength_c=c[2],score_c=c[3],contract_c=c[4],premium_c=c[5],cost_c=c[6],conf_c=conf_count)
-    except Exception as e:
-        base["signal"]="WAIT"
-        return render_template_string(PAGE,**base)
+        result = analyze(fetch_candles())
+    except Exception as exc:
+        log.exception("Dashboard analysis failed")
+        error = str(exc)
+    return render_template_string(HTML, r=result, error=error)
 
-@app.route("/login")
-def login():
-    if not CLIENT_ID or not SECRET: return "FYERS_CLIENT_ID / FYERS_SECRET is missing in Render Environment Variables.",500
-    if not REDIRECT_URI: return "FYERS_REDIRECT_URI is missing. Set it to your Render URL + /callback.",500
-    s=fyersModel.SessionModel(client_id=CLIENT_ID,secret_key=SECRET,redirect_uri=REDIRECT_URI,response_type="code",grant_type="authorization_code")
-    return redirect(s.generate_authcode())
+@app.route("/health")
+def health():
+    return jsonify({"ok":True,"timeframe":"3m","credentials_configured":bool(FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN),
+        "order_placement":False,"mode":"educational_analysis_only","server_time_ist":now_ist().isoformat()})
 
-@app.route("/callback")
-def callback():
-    global ACCESS_TOKEN
-    code=request.args.get("auth_code")
-    if not code: return "Missing auth_code. FYERS did not return an authorization code.",400
-    if not CLIENT_ID or not SECRET or not REDIRECT_URI: return "FYERS OAuth environment variables are not configured correctly in Render.",500
-    try:
-        s=fyersModel.SessionModel(client_id=CLIENT_ID,secret_key=SECRET,redirect_uri=REDIRECT_URI,response_type="code",grant_type="authorization_code")
-        s.set_token(code)
-        r=s.generate_token()
-        token=r.get("access_token","")
-        if not token: return "<h3>FYERS login failed</h3><pre>"+str(r)+"</pre>",400
-        ACCESS_TOKEN=token
-        return redirect("/")
-    except Exception as e: return "<h3>FYERS login error</h3><pre>"+str(e)+"</pre>",500
-
-@app.get("/health")
-def health(): return {"ok":True}
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
+if __name__ == "__main__":
+    if app.secret_key == "change-this-secret":
+        log.warning("FLASK_SECRET_KEY is not set; configure a unique secret.")
+    app.run(host=os.getenv("HOST","0.0.0.0"), port=int(os.getenv("PORT","5000")), debug=False)
