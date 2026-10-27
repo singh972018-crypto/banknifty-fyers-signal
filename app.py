@@ -2,7 +2,7 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request, redirect
 from fyers_apiv3 import fyersModel
 
 # Educational 3-minute market-data dashboard only.
@@ -11,6 +11,11 @@ app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("market-study")
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID", "").strip()
+SECRET = os.getenv("FYERS_SECRET", "").strip()
+REDIRECT_URI = os.getenv(
+    "FYERS_REDIRECT_URI",
+    os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/") + "/callback"
+).strip()
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN", "").strip()
 SYMBOL = os.getenv("FYERS_SYMBOL", "NSE:NIFTYBANK-INDEX").strip()
 TIMEFRAME = "3"
@@ -135,11 +140,54 @@ def home():
         msg = str(exc) if "missing in Render Environment" in str(exc) else "Could not load market data. Check Render logs, FYERS token, symbol and permissions."
         return render_template_string(ERROR, message=msg), 503
 
+@app.route("/login")
+def login():
+    if not CLIENT_ID or not SECRET:
+        return "FYERS_CLIENT_ID / FYERS_SECRET is missing in Render Environment Variables.", 500
+    if not REDIRECT_URI or not REDIRECT_URI.endswith("/callback"):
+        return "FYERS_REDIRECT_URI must be your Render service URL ending in /callback.", 500
+    session = fyersModel.SessionModel(
+        client_id=CLIENT_ID, secret_key=SECRET, redirect_uri=REDIRECT_URI,
+        response_type="code", grant_type="authorization_code"
+    )
+    return redirect(session.generate_authcode())
+
+
+@app.route("/callback")
+def callback():
+    global ACCESS_TOKEN
+    code = request.args.get("auth_code")
+    if not code:
+        return "Missing auth_code. FYERS did not return an authorization code.", 400
+    if not CLIENT_ID or not SECRET or not REDIRECT_URI:
+        return "FYERS OAuth environment variables are not configured correctly in Render.", 500
+    try:
+        session = fyersModel.SessionModel(
+            client_id=CLIENT_ID, secret_key=SECRET, redirect_uri=REDIRECT_URI,
+            response_type="code", grant_type="authorization_code"
+        )
+        session.set_token(code)
+        response = session.generate_token()
+        token = response.get("access_token", "") if isinstance(response, dict) else ""
+        if not token:
+            logger.error("FYERS OAuth token generation failed; response type=%s", type(response).__name__)
+            return "FYERS login did not return an access token. Check Render logs and FYERS app settings.", 400
+        # Token is kept in process memory only. For persistence after restarts,
+        # set FYERS_ACCESS_TOKEN in Render Environment and redeploy.
+        ACCESS_TOKEN = token
+        return redirect("/")
+    except Exception:
+        logger.exception("FYERS OAuth callback failed")
+        return "FYERS login error. Check Render logs and FYERS app configuration.", 500
+
+
 @app.route("/health")
 def health():
     ok = bool(CLIENT_ID and ACCESS_TOKEN)
-    return jsonify({"status":"ok" if ok else "configuration_missing","credentials_configured":ok,
-        "symbol":SYMBOL,"resolution":TIMEFRAME,"refresh_seconds":REFRESH_SECONDS,
+    return jsonify({"status":"ok" if ok else "configuration_missing",
+        "credentials_configured":ok, "client_id_present":bool(CLIENT_ID),
+        "access_token_present":bool(ACCESS_TOKEN), "symbol":SYMBOL,
+        "resolution":TIMEFRAME, "refresh_seconds":REFRESH_SECONDS,
         "mode":"educational_market_study_only"}), (200 if ok else 503)
 
 if __name__ == "__main__":
