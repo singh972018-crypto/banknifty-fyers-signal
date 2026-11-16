@@ -62,6 +62,13 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="row"><span>3. RSI Momentum</span><b class="{{c3_cls}}">{{c3}}</b></div>
 <div class="row"><span>4. Volume Confirmation</span><b class="{{c4_cls}}">{{c4}}</b></div>
 </div></div>
+<div class="card"><h3>🔄 Reversal Watch (Balanced)</h3>
+<div class="sig {{reversal_cls}}" style="font-size:28px">{{reversal_status}}</div>
+<div class="row"><span>Reversal checks</span><b>{{reversal_score}}/3</b></div>
+<div class="row"><span>Price vs EMA 9</span><b>{{rev_price}}</b></div>
+<div class="row"><span>Recent candle direction</span><b>{{rev_candles}}</b></div>
+<div class="row"><span>RSI momentum</span><b>{{rev_rsi}}</b></div>
+<p class="small">Warning is informational. A confirmed reversal changes the signal to WAIT; it does not automatically reverse CALL/PUT.</p></div>
 <div class="card"><h3>🧭 Strength Confirmations</h3>
 <div class="row"><span>ADX + DI Trend Strength</span><b class="{{x1_cls}}">{{x1}}</b></div>
 <div class="row"><span>Candle Confirmation</span><b class="{{x2_cls}}">{{x2}}</b></div>
@@ -79,7 +86,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="row"><span>ATR</span><b>{{atr}}</b></div>
 <div class="row"><span>Candle Range</span><b>{{candle_range}}</b></div>
 </div>
-<div class="card"><p>Technical signal only; not a guaranteed trade.</p>
+<div class="card"><p>Educational / paper-testing signal only; not a guaranteed outcome or a recommendation to place trades.</p>
 <p class="small">Levels are estimates from the current option premium and 3-minute signal; not guaranteed execution prices.</p></div>
 <br><a href="/login">Connect FYERS</a>
 """
@@ -229,6 +236,68 @@ def condition_class(value):
     if value=="FAIL": return "fail"
     return "neutral"
 
+# Process-local confirmation state: count only newly completed 3-minute candles.
+REVERSAL_STATE = {"direction": None, "last_timestamp": None, "streak": 0}
+
+def _rsi_value(closes):
+    if len(closes) < 15: return 50.0
+    changes=[closes[i]-closes[i-1] for i in range(1,len(closes))][-14:]
+    gains=sum(max(x,0) for x in changes)/14
+    losses=sum(max(-x,0) for x in changes)/14
+    return 100.0 if losses==0 else 100-(100/(1+gains/losses))
+
+def apply_reversal_filter(candles, result):
+    """Balanced early-warning layer using completed candles only."""
+    global REVERSAL_STATE
+    completed=candles[:-1] if len(candles)>1 else []  # exclude potentially forming candle
+    if len(completed)<16:
+        result.update(reversal_status="Insufficient completed candles", reversal_score=0,
+            reversal_cls="wait", rev_price="—", rev_candles="—", rev_rsi="—")
+        return result
+    closes=[float(x[4]) for x in completed]
+    last_close=closes[-1]
+    ema9_completed=ema(closes[-60:],9)
+    rsi_now=_rsi_value(closes)
+    rsi_prev=_rsi_value(closes[:-1])
+    falling_two=closes[-1] < closes[-2] < closes[-3]
+    rising_two=closes[-1] > closes[-2] > closes[-3]
+    direction=result.get("signal")
+    if direction=="CALL":
+        checks=[last_close < ema9_completed, falling_two, (rsi_now < 50 or rsi_now < rsi_prev)]
+        opposite="PUT"; price_text="Below EMA 9" if checks[0] else "Above EMA 9"
+        candle_text="2 lower closes" if checks[1] else "No 2-close decline"
+        rsi_text="Weakening" if checks[2] else "Not weakening"
+    elif direction=="PUT":
+        checks=[last_close > ema9_completed, rising_two, (rsi_now > 50 or rsi_now > rsi_prev)]
+        opposite="CALL"; price_text="Above EMA 9" if checks[0] else "Below EMA 9"
+        candle_text="2 higher closes" if checks[1] else "No 2-close rise"
+        rsi_text="Strengthening" if checks[2] else "Not strengthening"
+    else:
+        result.update(reversal_status="No active trend to monitor", reversal_score=0,
+            reversal_cls="wait", rev_price="—", rev_candles="—", rev_rsi="—")
+        REVERSAL_STATE={"direction":None,"last_timestamp":None,"streak":0}
+        return result
+    count=sum(checks)
+    stamp=completed[-1][0]
+    if count==3:
+        if REVERSAL_STATE["direction"]==direction and REVERSAL_STATE["last_timestamp"]!=stamp:
+            REVERSAL_STATE["streak"]+=1
+        elif REVERSAL_STATE["direction"]!=direction:
+            REVERSAL_STATE={"direction":direction,"last_timestamp":stamp,"streak":1}
+        REVERSAL_STATE["last_timestamp"]=stamp
+    else:
+        REVERSAL_STATE={"direction":direction,"last_timestamp":stamp,"streak":0}
+    if count>=2 and REVERSAL_STATE["streak"]>=2:
+        result["signal"]="WAIT"; result["strength"]="REVERSAL CONFIRMED"
+        status="CONFIRMED → WAIT"; cls="wait"
+    elif count>=2:
+        status=f"{direction} WEAKENING"; cls="wait"
+    else:
+        status="No strong reversal warning"; cls="call" if direction=="CALL" else "put"
+    result.update(reversal_status=status,reversal_score=count,reversal_cls=cls,
+        rev_price=price_text,rev_candles=candle_text,rev_rsi=rsi_text)
+    return result
+
 @app.route("/")
 def home():
     base=dict(signal="WAIT",cls="wait",score=0,spot="—",strength="—",
@@ -237,7 +306,7 @@ def home():
         price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—",adx="—",atr="—",candle_range="—",
         sig_a="WAIT",sig_a_cls="wait",strength_a="—",score_a=0,contract_a="—",premium_a="—",cost_a="—",
         sig_b="WAIT",sig_b_cls="wait",strength_b="—",score_b=0,contract_b="—",premium_b="—",cost_b="—",
-        sig_c="WAIT",sig_c_cls="wait",strength_c="—",score_c=0,contract_c="—",premium_c="—",cost_c="—",conf_c=0)
+        sig_c="WAIT",sig_c_cls="wait",strength_c="—",score_c=0,contract_c="—",premium_c="—",cost_c="—",conf_c=0,reversal_status="Waiting for data",reversal_score=0,reversal_cls="wait",rev_price="—",rev_candles="—",rev_rsi="—")
     if not ACCESS_TOKEN: return render_template_string(PAGE,**base)
     try:
         fy=fyersModel.FyersModel(client_id=CLIENT_ID,token=ACCESS_TOKEN,is_async=False,log_path="")
@@ -245,7 +314,7 @@ def home():
         response=fy.history({"symbol":"NSE:NIFTYBANK-INDEX","resolution":"3","date_format":"1","range_from":start.strftime("%Y-%m-%d"),"range_to":now.strftime("%Y-%m-%d"),"cont_flag":"1"})
         candles=response.get("candles",[])
         if len(candles)<60: raise ValueError("Not enough 3-minute candles returned by FYERS.")
-        result=calc(candles); sig=result["signal"]; score=result["score"]; spot=result["spot"]
+        result=calc(candles); result=apply_reversal_filter(candles,result); sig=result["signal"]; score=result["score"]; spot=result["spot"]
         cond=result["conditions"]; conf=result["confirmations"]; conf_count=sum(x=="PASS" for x in conf)
         # A/B/C are TOTAL 1-LOT VALUE slabs: A ₹0–₹2,000; B ₹2,001–₹5,000; C ₹5,001+
         cards=[None,None,None]
@@ -270,7 +339,7 @@ def home():
             price=round(result["spot"],2),ema9=round(result["ema9"],2),ema21=round(result["ema21"],2),vwap=round(result["vwap"],2),rsi=round(result["rsi"],2),volume=round(result["volume"],0),avg_volume=round(result["avg_volume"],0),adx=round(result["adx"],1),atr=round(result["atr"],2),candle_range=round(result["candle_range"],2),
             sig_a=a[0],sig_a_cls=a[1],strength_a=a[2],score_a=a[3],contract_a=a[4],premium_a=a[5],cost_a=a[6],
             sig_b=b[0],sig_b_cls=b[1],strength_b=b[2],score_b=b[3],contract_b=b[4],premium_b=b[5],cost_b=b[6],
-            sig_c=c[0],sig_c_cls=c[1],strength_c=c[2],score_c=c[3],contract_c=c[4],premium_c=c[5],cost_c=c[6],conf_c=conf_count)
+            sig_c=c[0],sig_c_cls=c[1],strength_c=c[2],score_c=c[3],contract_c=c[4],premium_c=c[5],cost_c=c[6],conf_c=conf_count,reversal_status=result.get("reversal_status","—"),reversal_score=result.get("reversal_score",0),reversal_cls=result.get("reversal_cls","wait"),rev_price=result.get("rev_price","—"),rev_candles=result.get("rev_candles","—"),rev_rsi=result.get("rev_rsi","—"))
     except Exception as e:
         base["signal"]="WAIT"
         return render_template_string(PAGE,**base)
