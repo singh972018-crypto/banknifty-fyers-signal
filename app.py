@@ -1,4 +1,5 @@
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, redirect, render_template_string
 import requests
@@ -30,7 +31,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="card"><b>🔄 Auto-refresh: ON</b><br><span class="small">Page refreshes every 3 minutes to fetch the latest signal.</span></div>
 <div class="card"><h3>🟢 LIVE ANALYSIS A — Budget band ₹2,000</h3>
 <div class="sig {{sig_a_cls}}">{{sig_a}}</div>
-<div class="row"><span>Signal changed at (IST)</span><b>{{signal_time}}</b></div>
+<div class="row"><span>Signal confirmed at (IST)</span><b>{{signal_time}}</b></div>
 <p><b>{{strength_a}}</b> &nbsp; Score: <b>{{score_a}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
 <div class="row"><span>Reference option</span><b>{{contract_a}}</b></div>
@@ -40,7 +41,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 
 <div class="card"><h3>🔵 LIVE ANALYSIS B — 1-Lot Budget ₹2,001–₹5,000</h3>
 <div class="sig {{sig_b_cls}}">{{sig_b}}</div>
-<div class="row"><span>Signal changed at (IST)</span><b>{{signal_time}}</b></div>
+<div class="row"><span>Signal confirmed at (IST)</span><b>{{signal_time}}</b></div>
 <p><b>{{strength_b}}</b> &nbsp; Score: <b>{{score_b}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
 <div class="row"><span>Reference option</span><b>{{contract_b}}</b></div>
@@ -50,7 +51,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 
 <div class="card"><h3>🟣 LIVE ANALYSIS C — 1-Lot Budget ₹5,001+ / Unlimited</h3>
 <div class="sig {{sig_c_cls}}">{{sig_c}}</div>
-<div class="row"><span>Signal changed at (IST)</span><b>{{signal_time}}</b></div>
+<div class="row"><span>Signal confirmed at (IST)</span><b>{{signal_time}}</b></div>
 <p><b>{{strength_c}}</b> &nbsp; Score: <b>{{score_c}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
 <div class="row"><span>Reference option</span><b>{{contract_c}}</b></div>
@@ -65,6 +66,13 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="row"><span>3. RSI Momentum</span><b class="{{c3_cls}}">{{c3}}</b></div>
 <div class="row"><span>4. Volume Confirmation</span><b class="{{c4_cls}}">{{c4}}</b></div>
 </div></div>
+<div class="card"><h3>🕒 Recent Signal Changes</h3>
+{% if signal_history %}
+{% for item in signal_history %}
+<div class="row"><span>{{item["signal"]}}</span><b>{{item["time"]}}</b></div>
+{% endfor %}
+{% else %}<span class="small">No saved signal changes yet.</span>{% endif %}
+<p class="small">Times are based on completed 3-minute candles (IST).</p></div>
 <div class="card"><h3>🔄 Reversal Watch (Balanced)</h3>
 <div class="sig {{reversal_cls}}" style="font-size:28px">{{reversal_status}}</div>
 <div class="row"><span>Reversal checks</span><b>{{reversal_score}}/3</b></div>
@@ -239,11 +247,115 @@ def condition_class(value):
     if value=="FAIL": return "fail"
     return "neutral"
 
-# Process-local confirmation state: count only newly completed 3-minute candles.
+# SQLite stores signal changes and reversal state. On Render, set SIGNAL_DB_PATH
+# to a file on a mounted persistent disk (for example /var/data/signals.sqlite3).
+SIGNAL_DB_PATH = os.getenv("SIGNAL_DB_PATH", "signal_history.sqlite3")
+IST = timezone(timedelta(hours=5, minutes=30))
 REVERSAL_STATE = {"direction": None, "last_timestamp": None, "streak": 0}
 
-# Signal-change clock: updates only when CALL / PUT / WAIT actually changes.
-SIGNAL_CLOCK = {"signal": None, "time": "—"}
+
+def db_connect():
+    conn = sqlite3.connect(SIGNAL_DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with db_connect() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""CREATE TABLE IF NOT EXISTS signal_state (
+            id INTEGER PRIMARY KEY CHECK(id=1), last_processed_ts INTEGER,
+            signal TEXT, signal_time TEXT, reversal_direction TEXT,
+            reversal_last_timestamp INTEGER, reversal_streak INTEGER NOT NULL DEFAULT 0
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS signal_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, signal TEXT NOT NULL,
+            candle_ts INTEGER NOT NULL, confirmed_at TEXT NOT NULL,
+            UNIQUE(signal, candle_ts)
+        )""")
+
+
+def candle_epoch(candle):
+    return int(float(candle[0]))
+
+
+def ist_confirmed_time(candle):
+    # FYERS candle timestamp marks candle start; confirmation is at candle close.
+    return datetime.fromtimestamp(candle_epoch(candle) + 180, timezone.utc).astimezone(IST).strftime("%I:%M:%S %p")
+
+
+def save_signal_state(conn, last_ts, signal, signal_time, reversal_state):
+    conn.execute("""INSERT INTO signal_state
+        (id,last_processed_ts,signal,signal_time,reversal_direction,reversal_last_timestamp,reversal_streak)
+        VALUES (1,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+        last_processed_ts=excluded.last_processed_ts, signal=excluded.signal,
+        signal_time=excluded.signal_time, reversal_direction=excluded.reversal_direction,
+        reversal_last_timestamp=excluded.reversal_last_timestamp,
+        reversal_streak=excluded.reversal_streak""",
+        (last_ts, signal, signal_time, reversal_state.get("direction"),
+         reversal_state.get("last_timestamp"), reversal_state.get("streak", 0)))
+
+
+def evaluate_completed_history(completed_candles):
+    """Replay new completed candles once; persist every CALL/PUT/WAIT transition."""
+    global REVERSAL_STATE
+    if len(completed_candles) < 60:
+        raise ValueError("Not enough completed 3-minute candles for signal calculation.")
+
+    with db_connect() as conn:
+        row=conn.execute("SELECT * FROM signal_state WHERE id=1").fetchone()
+        if row:
+            REVERSAL_STATE={"direction":row["reversal_direction"],
+                "last_timestamp":row["reversal_last_timestamp"],
+                "streak":int(row["reversal_streak"] or 0)}
+            last_processed=int(row["last_processed_ts"] or 0)
+            current_signal=row["signal"]
+            signal_time=row["signal_time"] or "—"
+        else:
+            REVERSAL_STATE={"direction":None,"last_timestamp":None,"streak":0}
+            last_processed=0
+            current_signal=None
+            signal_time="—"
+
+        latest_result=None
+        for idx in range(59, len(completed_candles)):
+            prefix=completed_candles[:idx+1]
+            candle_ts=candle_epoch(prefix[-1])
+            if row and candle_ts <= last_processed:
+                continue
+            result=calc(prefix)
+            result=apply_reversal_filter(prefix,result)
+            new_signal=result["signal"]
+            if new_signal != current_signal:
+                signal_time=ist_confirmed_time(prefix[-1])
+                conn.execute("INSERT OR IGNORE INTO signal_events(signal,candle_ts,confirmed_at) VALUES(?,?,?)",
+                             (new_signal,candle_ts,signal_time))
+                current_signal=new_signal
+            last_processed=candle_ts
+            save_signal_state(conn,last_processed,current_signal,signal_time,REVERSAL_STATE)
+            latest_result=result
+
+        # If no new candle arrived, calculate the latest display without advancing state.
+        if latest_result is None:
+            result=calc(completed_candles)
+            result=apply_reversal_filter(completed_candles,result)
+            latest_result=result
+            # If database is new or has no state yet, initialize safely from this result.
+            if current_signal is None:
+                current_signal=result["signal"]
+                signal_time=ist_confirmed_time(completed_candles[-1])
+                last_processed=candle_epoch(completed_candles[-1])
+                conn.execute("INSERT OR IGNORE INTO signal_events(signal,candle_ts,confirmed_at) VALUES(?,?,?)",
+                             (current_signal,last_processed,signal_time))
+                save_signal_state(conn,last_processed,current_signal,signal_time,REVERSAL_STATE)
+
+        # Keep display signal and persisted state aligned with the last completed candle.
+        latest_result["signal"]=current_signal or latest_result["signal"]
+        events=conn.execute("SELECT signal,confirmed_at FROM signal_events ORDER BY candle_ts DESC,id DESC LIMIT 8").fetchall()
+        history=[{"signal":e["signal"],"time":e["confirmed_at"]} for e in events]
+        return latest_result, (signal_time or "—"), history
+
+init_db()
 
 def _rsi_value(closes):
     if len(closes) < 15: return 50.0
@@ -255,7 +367,7 @@ def _rsi_value(closes):
 def apply_reversal_filter(candles, result):
     """Balanced early-warning layer using completed candles only."""
     global REVERSAL_STATE
-    completed=candles[:-1] if len(candles)>1 else []  # exclude potentially forming candle
+    completed=candles  # caller passes only fully completed candles
     if len(completed)<16:
         result.update(reversal_status="Insufficient completed candles", reversal_score=0,
             reversal_cls="wait", rev_price="—", rev_candles="—", rev_rsi="—")
@@ -311,23 +423,24 @@ def home():
         x1="—",x2="—",x3="—",x1_cls="neutral",x2_cls="neutral",x3_cls="neutral",
         price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—",adx="—",atr="—",candle_range="—",
         sig_a="WAIT",sig_a_cls="wait",strength_a="—",score_a=0,contract_a="—",premium_a="—",cost_a="—",
-        sig_b="WAIT",sig_b_cls="wait",strength_b="—",score_b=0,contract_b="—",premium_b="—",cost_b="—",
-        sig_c="WAIT",sig_c_cls="wait",strength_c="—",score_c=0,contract_c="—",premium_c="—",cost_c="—",conf_c=0,reversal_status="Waiting for data",reversal_score=0,reversal_cls="wait",rev_price="—",rev_candles="—",rev_rsi="—",signal_time="—")
-    if not ACCESS_TOKEN: return render_template_string(PAGE,**base)
+        sig_b="WAIT",sig_b_cls="wait",strength_b="—",score_b=0,contract_b="—",premium_b="—",cost_b="—", 
+        sig_c="WAIT",sig_c_cls="wait",strength_c="—",score_c=0,contract_c="—",premium_c="—",cost_c="—",conf_c=0,
+        reversal_status="Waiting for data",reversal_score=0,reversal_cls="wait",rev_price="—",rev_candles="—",rev_rsi="—",
+        signal_time="—",signal_history=[])
+    if not ACCESS_TOKEN:
+        return render_template_string(PAGE,**base)
     try:
         fy=fyersModel.FyersModel(client_id=CLIENT_ID,token=ACCESS_TOKEN,is_async=False,log_path="")
         now=datetime.now(timezone.utc); start=now-timedelta(days=5)
-        response=fy.history({"symbol":"NSE:NIFTYBANK-INDEX","resolution":"3","date_format":"1","range_from":start.strftime("%Y-%m-%d"),"range_to":now.strftime("%Y-%m-%d"),"cont_flag":"1"})
+        response=fy.history({"symbol":"NSE:NIFTYBANK-INDEX","resolution":"3","date_format":"1",
+            "range_from":start.strftime("%Y-%m-%d"),"range_to":now.strftime("%Y-%m-%d"),"cont_flag":"1"})
         candles=response.get("candles",[])
-        if len(candles)<60: raise ValueError("Not enough 3-minute candles returned by FYERS.")
-        result=calc(candles); result=apply_reversal_filter(candles,result); sig=result["signal"]; score=result["score"]; spot=result["spot"]
-        if SIGNAL_CLOCK["signal"] != sig:
-            ist=timezone(timedelta(hours=5, minutes=30))
-            SIGNAL_CLOCK["signal"]=sig
-            SIGNAL_CLOCK["time"]=datetime.now(ist).strftime("%I:%M:%S %p")
-        signal_time=SIGNAL_CLOCK["time"]
+        # A candle is eligible only after its full 180-second interval has ended.
+        now_epoch=int(now.timestamp())
+        completed=[c for c in candles if candle_epoch(c)+180 <= now_epoch]
+        result,signal_time,signal_history=evaluate_completed_history(completed)
+        sig=result["signal"]; score=result["score"]; spot=result["spot"]
         cond=result["conditions"]; conf=result["confirmations"]; conf_count=sum(x=="PASS" for x in conf)
-        # A/B/C are TOTAL 1-LOT VALUE slabs: A ₹0–₹2,000; B ₹2,001–₹5,000; C ₹5,001+
         cards=[None,None,None]
         if sig in ("CALL","PUT"):
             try: cards[0]=pick_budget_option(spot,sig,0,2000)
@@ -347,12 +460,18 @@ def home():
         return render_template_string(PAGE,signal=sig,cls=sig.lower(),score=abs(score),strength=result["strength"],spot=round(spot,2),
             c1=cond[0],c2=cond[1],c3=cond[2],c4=cond[3],c1_cls=condition_class(cond[0]),c2_cls=condition_class(cond[1]),c3_cls=condition_class(cond[2]),c4_cls=condition_class(cond[3]),
             x1=conf[0],x2=conf[1],x3=conf[2],x1_cls=condition_class(conf[0]),x2_cls=condition_class(conf[1]),x3_cls=condition_class(conf[2]),
-            price=round(result["spot"],2),ema9=round(result["ema9"],2),ema21=round(result["ema21"],2),vwap=round(result["vwap"],2),rsi=round(result["rsi"],2),volume=round(result["volume"],0),avg_volume=round(result["avg_volume"],0),adx=round(result["adx"],1),atr=round(result["atr"],2),candle_range=round(result["candle_range"],2),
+            price=round(result["spot"],2),ema9=round(result["ema9"],2),ema21=round(result["ema21"],2),vwap=round(result["vwap"],2),rsi=round(result["rsi"],2),
+            volume=round(result["volume"],0),avg_volume=round(result["avg_volume"],0),adx=round(result["adx"],1),atr=round(result["atr"],2),candle_range=round(result["candle_range"],2),
             sig_a=a[0],sig_a_cls=a[1],strength_a=a[2],score_a=a[3],contract_a=a[4],premium_a=a[5],cost_a=a[6],
             sig_b=b[0],sig_b_cls=b[1],strength_b=b[2],score_b=b[3],contract_b=b[4],premium_b=b[5],cost_b=b[6],
-            sig_c=c[0],sig_c_cls=c[1],strength_c=c[2],score_c=c[3],contract_c=c[4],premium_c=c[5],cost_c=c[6],conf_c=conf_count,reversal_status=result.get("reversal_status","—"),reversal_score=result.get("reversal_score",0),reversal_cls=result.get("reversal_cls","wait"),rev_price=result.get("rev_price","—"),rev_candles=result.get("rev_candles","—"),rev_rsi=result.get("rev_rsi","—"),signal_time=signal_time)
+            sig_c=c[0],sig_c_cls=c[1],strength_c=c[2],score_c=c[3],contract_c=c[4],premium_c=c[5],cost_c=c[6],conf_c=conf_count,
+            reversal_status=result.get("reversal_status","—"),reversal_score=result.get("reversal_score",0),reversal_cls=result.get("reversal_cls","wait"),
+            rev_price=result.get("rev_price","—"),rev_candles=result.get("rev_candles","—"),rev_rsi=result.get("rev_rsi","—"),
+            signal_time=signal_time,signal_history=signal_history)
     except Exception as e:
         base["signal"]="WAIT"
+        base["reversal_status"]="Data / calculation error"
+        base["signal_history"]=[]
         return render_template_string(PAGE,**base)
 
 @app.route("/login")
