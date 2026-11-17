@@ -30,6 +30,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 <div class="card"><b>🔄 Auto-refresh: ON</b><br><span class="small">Page refreshes every 3 minutes to fetch the latest signal.</span></div>
 <div class="card"><h3>🟢 LIVE ANALYSIS A — Budget band ₹2,000</h3>
 <div class="sig {{sig_a_cls}}">{{sig_a}}</div>
+<div class="row"><span>Signal changed at (IST)</span><b>{{signal_time}}</b></div>
 <p><b>{{strength_a}}</b> &nbsp; Score: <b>{{score_a}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
 <div class="row"><span>Reference option</span><b>{{contract_a}}</b></div>
@@ -39,6 +40,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 
 <div class="card"><h3>🔵 LIVE ANALYSIS B — 1-Lot Budget ₹2,001–₹5,000</h3>
 <div class="sig {{sig_b_cls}}">{{sig_b}}</div>
+<div class="row"><span>Signal changed at (IST)</span><b>{{signal_time}}</b></div>
 <p><b>{{strength_b}}</b> &nbsp; Score: <b>{{score_b}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
 <div class="row"><span>Reference option</span><b>{{contract_b}}</b></div>
@@ -48,6 +50,7 @@ a{color:white;background:#333;padding:12px;border-radius:10px;text-decoration:no
 
 <div class="card"><h3>🟣 LIVE ANALYSIS C — 1-Lot Budget ₹5,001+ / Unlimited</h3>
 <div class="sig {{sig_c_cls}}">{{sig_c}}</div>
+<div class="row"><span>Signal changed at (IST)</span><b>{{signal_time}}</b></div>
 <p><b>{{strength_c}}</b> &nbsp; Score: <b>{{score_c}}/4</b> &nbsp; <span class="small">Signal comes from live BankNifty indicators</span></p>
 <div class="row"><span>BankNifty spot</span><b>{{spot}}</b></div>
 <div class="row"><span>Reference option</span><b>{{contract_c}}</b></div>
@@ -239,6 +242,9 @@ def condition_class(value):
 # Process-local confirmation state: count only newly completed 3-minute candles.
 REVERSAL_STATE = {"direction": None, "last_timestamp": None, "streak": 0}
 
+# Signal-change clock: updates only when CALL / PUT / WAIT actually changes.
+SIGNAL_CLOCK = {"signal": None, "time": "—"}
+
 def _rsi_value(closes):
     if len(closes) < 15: return 50.0
     changes=[closes[i]-closes[i-1] for i in range(1,len(closes))][-14:]
@@ -306,7 +312,7 @@ def home():
         price="—",ema9="—",ema21="—",vwap="—",rsi="—",volume="—",avg_volume="—",adx="—",atr="—",candle_range="—",
         sig_a="WAIT",sig_a_cls="wait",strength_a="—",score_a=0,contract_a="—",premium_a="—",cost_a="—",
         sig_b="WAIT",sig_b_cls="wait",strength_b="—",score_b=0,contract_b="—",premium_b="—",cost_b="—",
-        sig_c="WAIT",sig_c_cls="wait",strength_c="—",score_c=0,contract_c="—",premium_c="—",cost_c="—",conf_c=0,reversal_status="Waiting for data",reversal_score=0,reversal_cls="wait",rev_price="—",rev_candles="—",rev_rsi="—")
+        sig_c="WAIT",sig_c_cls="wait",strength_c="—",score_c=0,contract_c="—",premium_c="—",cost_c="—",conf_c=0,reversal_status="Waiting for data",reversal_score=0,reversal_cls="wait",rev_price="—",rev_candles="—",rev_rsi="—",signal_time="—")
     if not ACCESS_TOKEN: return render_template_string(PAGE,**base)
     try:
         fy=fyersModel.FyersModel(client_id=CLIENT_ID,token=ACCESS_TOKEN,is_async=False,log_path="")
@@ -315,6 +321,11 @@ def home():
         candles=response.get("candles",[])
         if len(candles)<60: raise ValueError("Not enough 3-minute candles returned by FYERS.")
         result=calc(candles); result=apply_reversal_filter(candles,result); sig=result["signal"]; score=result["score"]; spot=result["spot"]
+        if SIGNAL_CLOCK["signal"] != sig:
+            ist=timezone(timedelta(hours=5, minutes=30))
+            SIGNAL_CLOCK["signal"]=sig
+            SIGNAL_CLOCK["time"]=datetime.now(ist).strftime("%I:%M:%S %p")
+        signal_time=SIGNAL_CLOCK["time"]
         cond=result["conditions"]; conf=result["confirmations"]; conf_count=sum(x=="PASS" for x in conf)
         # A/B/C are TOTAL 1-LOT VALUE slabs: A ₹0–₹2,000; B ₹2,001–₹5,000; C ₹5,001+
         cards=[None,None,None]
@@ -339,7 +350,7 @@ def home():
             price=round(result["spot"],2),ema9=round(result["ema9"],2),ema21=round(result["ema21"],2),vwap=round(result["vwap"],2),rsi=round(result["rsi"],2),volume=round(result["volume"],0),avg_volume=round(result["avg_volume"],0),adx=round(result["adx"],1),atr=round(result["atr"],2),candle_range=round(result["candle_range"],2),
             sig_a=a[0],sig_a_cls=a[1],strength_a=a[2],score_a=a[3],contract_a=a[4],premium_a=a[5],cost_a=a[6],
             sig_b=b[0],sig_b_cls=b[1],strength_b=b[2],score_b=b[3],contract_b=b[4],premium_b=b[5],cost_b=b[6],
-            sig_c=c[0],sig_c_cls=c[1],strength_c=c[2],score_c=c[3],contract_c=c[4],premium_c=c[5],cost_c=c[6],conf_c=conf_count,reversal_status=result.get("reversal_status","—"),reversal_score=result.get("reversal_score",0),reversal_cls=result.get("reversal_cls","wait"),rev_price=result.get("rev_price","—"),rev_candles=result.get("rev_candles","—"),rev_rsi=result.get("rev_rsi","—"))
+            sig_c=c[0],sig_c_cls=c[1],strength_c=c[2],score_c=c[3],contract_c=c[4],premium_c=c[5],cost_c=c[6],conf_c=conf_count,reversal_status=result.get("reversal_status","—"),reversal_score=result.get("reversal_score",0),reversal_cls=result.get("reversal_cls","wait"),rev_price=result.get("rev_price","—"),rev_candles=result.get("rev_candles","—"),rev_rsi=result.get("rev_rsi","—"),signal_time=signal_time)
     except Exception as e:
         base["signal"]="WAIT"
         return render_template_string(PAGE,**base)
